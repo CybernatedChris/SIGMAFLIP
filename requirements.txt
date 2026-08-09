@@ -1,0 +1,9 @@
+numpy
+soundfile
+sounddevice
+pygame-ce
+Pillow
+customtkinter
+fonttools
+opencv-python
+pycryptodome
