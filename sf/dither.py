@@ -6,7 +6,7 @@ def apply_ordered_dither(gray_img, mode, u=-0.25, v=-0.60):
     """Performs structured Bayer ordered dithering or halftone simulation directly on gray frames."""
     gray_copy = gray_img.copy()
     
-    if mode == "Flipnote Memory Saver":
+    if mode == "Flipnote Memory Saver (Experimental)":
         # 1. Downscale the grayscale image to the DSi's native 256x192 resolution
         img_256 = gray_copy.resize((256, 192), Image.Resampling.LANCZOS)
         pixels = img_256.load()
