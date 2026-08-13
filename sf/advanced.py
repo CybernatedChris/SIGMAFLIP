@@ -118,7 +118,7 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         "Bayer 3x3", 
         "Bayer 4x4", 
         "Bayer 8x8", 
-        "Flipnote Memory Saver",
+        "Flipnote Memory Saver (Experimental)",
         "Atkinson", 
         "Burkes", 
         "Jarvis-Judice-Ninke", 
@@ -180,5 +180,3 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
     )
     contrast_slider.set(settings.get("contrast", 1.0))
     contrast_slider.pack(fill="x", pady=(5, 0))
-
-    # ponytail: close button removed per user request — grid shows through instead
