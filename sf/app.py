@@ -314,8 +314,6 @@ class SIGMAFLIP:
         def on_release(e=None):
             if not getattr(btn, "_sf_down_img", None):
                 return
-            # A press held for a long time (e.g. a modal file dialog opened mid-click)
-            # isn't a "button push" — restore immediately instead of re-flashing.
             if time.time() - getattr(btn, "_sf_press_time", time.time()) > 0.25:
                 btn.configure(image=getattr(btn, "_sf_restore_target", None))
                 btn._sf_down_img = None
@@ -337,8 +335,6 @@ class SIGMAFLIP:
 
         btn.bind("<Button-1>", on_press, add="+")
         btn.bind("<ButtonRelease-1>", on_release, add="+")
-        # ponytail: CTk bug — textless buttons have no _text_label, so the root's
-        # bind_all click-to-focus crashes; these icon buttons don't need keyboard focus.
         btn.focus_set = lambda: None
 
     def _set_window_icon(self, window, delay=True):
@@ -558,7 +554,7 @@ class SIGMAFLIP:
                 self.on_appearance_mode_changed(curr_mode)
         except Exception:
             pass
-        self.root.after(2000, self.poll_appearance_mode)  # ponytail: 2s vs 500ms — theme changes are rare, no need to check 2x/sec
+        self.root.after(2000, self.poll_appearance_mode)
 
     def on_appearance_mode_changed(self, new_mode):
         """Forces full interface redraws of standard Tkinter elements when switching themes without breaking CustomTkinter tuples."""
@@ -585,7 +581,6 @@ class SIGMAFLIP:
         self.bg_canvas.place(x=0, y=0, relwidth=1, relheight=1)
         self.root.bind("<Configure>", self.draw_window_grid)
 
-        # ponytail: transparent container — let grid bg_canvas show through
         top_frame = ctk.CTkFrame(self.root, fg_color="transparent")
         top_frame.pack(fill="x", pady=5)
 
@@ -599,7 +594,7 @@ class SIGMAFLIP:
         )
         self.file_name_label.pack()
 
-        # Canvas Preview Box Wrapper (solid black — shows flipnote with fake bg)
+        # Canvas Preview Box Wrapper (solid black shows flipnote with fake bg)
         self.preview_frame = ctk.CTkFrame(self.preview_frame if hasattr(self, 'preview_frame') else self.root, width=320, height=240, fg_color="black", border_width=2, border_color=MAIN_COLOR)
         self.preview_frame.pack(pady=5)
         self.preview_frame.pack_propagate(False)
@@ -613,7 +608,6 @@ class SIGMAFLIP:
             self.preview_frame, width=320, height=240, fg_color="black", corner_radius=0
         )
 
-        # ponytail: transparent bg — grid shows through
         self.toggle_view_btn = ctk.CTkButton(
             self.root, text="Switch to Grid View", command=self.toggle_singular_view_mode,
             width=150, height=30, font=self.font_tiny, fg_color="transparent", text_color=self.main_color_adaptive, hover_color=self.highlight_color_adaptive
@@ -885,7 +879,6 @@ class SIGMAFLIP:
         wh = self.root.winfo_height()
         curr_mode = forced_mode if forced_mode else ctk.get_appearance_mode().lower()
         
-        # ponytail: filter child widget configure events & track last grid theme mode to correctly redraw standard Tkinter Canvas on system theme updates
         if ww == self.last_grid_w and wh == self.last_grid_h and curr_mode == self.last_grid_mode:
             return
             
@@ -985,7 +978,7 @@ class SIGMAFLIP:
         self.repack_singular_image_layout()
 
     def single_click_grid_image(self, index):
-        """Select grid thumbnail — updates selection visuals in-place without full rerender."""
+        """Select grid thumbnail, updates selection visuals in-place without full rerender."""
         self.play_sound('apply.mp3')
         old_idx = self.still_index
         self.still_index = index
@@ -1151,7 +1144,7 @@ class SIGMAFLIP:
             return None
 
     def _update_thumb_selection(self, old_idx, new_idx):
-        """In-place selection visual update — no full grid rerender."""
+        """In-place selection visual update, no full grid rerender."""
         curr_mode = ctk.get_appearance_mode().lower()
         if curr_mode == "light":
             sel_bg, sel_border = "#e5e7eb", self.highlight_color
@@ -1211,7 +1204,7 @@ class SIGMAFLIP:
         self.check_timing_warnings(show_popup=False)
 
     def move_frame_left(self):
-        """Shifts selected image index left — swaps cells in-place."""
+        """Shifts selected image index left, swaps cells in-place."""
         if self.still_index > 0:
             self.play_sound('apply.mp3')
             idx = self.still_index
@@ -1223,7 +1216,7 @@ class SIGMAFLIP:
             self.update_nav_buttons_state()
 
     def move_frame_right(self):
-        """Shifts selected image index right — swaps cells in-place."""
+        """Shifts selected image index right, swaps cells in-place."""
         if self.still_index < len(self.image_paths) - 1:
             self.play_sound('apply.mp3')
             idx = self.still_index
@@ -1518,7 +1511,6 @@ class SIGMAFLIP:
         self.video_fps = self.cap.get(cv2.CAP_PROP_FPS)
         if self.video_fps <= 0:
             self.video_fps = 24.0
-        # ponytail: OpenCV FPS for GIFs is frequently wrong; recompute from PIL frame durations
         if file_path.lower().endswith('.gif') and self.total_video_frames > 1:
             try:
                 gif = Image.open(file_path)
@@ -1548,7 +1540,7 @@ class SIGMAFLIP:
         self.update_frame_display()
 
     def show_prev_image(self):
-        """Navigates to the previous still image — in-place selection update in grid view."""
+        """Navigates to the previous still image, in-place selection update in grid view."""
         if self.still_index > 0:
             old_idx = self.still_index
             self.still_index -= 1
@@ -1561,7 +1553,7 @@ class SIGMAFLIP:
                 self.update_frame_display()
 
     def show_next_image(self):
-        """Navigates to the next still image — in-place selection update in grid view."""
+        """Navigates to the next still image, in-place selection update in grid view."""
         if self.still_index < len(self.image_paths) - 1:
             old_idx = self.still_index
             self.still_index += 1
@@ -1813,7 +1805,7 @@ class SIGMAFLIP:
                 else:
                     algo = getattr(Image, "FLOYDSTEINBERG", 3)
                 bw_img = gray_img.convert("1", dither=algo)
-            elif dither in ("Bayer 2x2", "Bayer 3x3", "Bayer 4x4", "Bayer 8x8", "Halftone", "Flipnote Memory Saver"):
+            elif dither in ("Bayer 2x2", "Bayer 3x3", "Bayer 4x4", "Bayer 8x8", "Halftone", "Flipnote Memory Saver (Experimental)"):
                 bw_img = self.apply_ordered_dither(gray_img, dither)
             elif dither in ("Atkinson", "Burkes", "Jarvis-Judice-Ninke", "Stucki", 
                             "Sierra 3-Row", "Sierra 2-Row", "Sierra Lite", "Stevenson-Arce"):
@@ -1980,11 +1972,10 @@ class SIGMAFLIP:
         delay_ms = int(1000 / target_fps)
         self.after_play_id = self.root.after(delay_ms, self.playback_tick)
 
-    # ponytail: COM marker padding ensures offset 0x18A lives in safe marker data
     DSI_SIG_PADDING = 512  # bytes of COM comment padding for signature area
 
     def _gf_mul2(self, block):
-        """GF(2^128) multiply by 2 — matches dsi_jpeg_signature_tool's weird_func exactly (bug included)."""
+        """GF(2^128) multiply by 2; matches dsi_jpeg_signature_tool's weird_func exactly."""
         b0 = int.from_bytes(block[0:4], 'little')
         b1 = int.from_bytes(block[4:8], 'little')
         b2 = int.from_bytes(block[8:12], 'little')
