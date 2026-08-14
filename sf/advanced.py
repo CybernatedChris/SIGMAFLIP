@@ -5,7 +5,7 @@ import tkinter as tk
 def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, settings, on_change_callback, set_icon_fn):
     """Generates a styled, centered, modeless Advanced Settings window with transparent frames [sf/advanced.py]."""
     adv = ctk.CTkToplevel(parent)
-    adv.title("Advanced Rendering Settings")
+    adv.title("Advanced Filters")
     adv.geometry("400x420")
     adv.resizable(False, False)
     adv.transient(parent)
