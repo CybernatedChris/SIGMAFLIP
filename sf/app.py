@@ -117,6 +117,8 @@ class SIGMAFLIP:
         # WAV preview engine variables
         self.temp_audio_path = None
         self.has_audio = False
+        self._music_paused = False
+        self._music_pos_anchor = 0
         self._playback_start_time = 0.0
         self._playback_start_frame = 0.0
 
@@ -389,11 +391,11 @@ class SIGMAFLIP:
 
         # Cascade Menu for custom Resizing Background
         self.bg_menu = tk.Menu(self.options_menu, tearoff=0, **menu_opts)
-        self.options_menu.add_cascade(label="Fit Background Mode", menu=self.bg_menu)
+        self.options_menu.add_cascade(label="Background Setting", menu=self.bg_menu)
 
         self.bg_menu.add_command(label="✓ Solid Black (Default)", command=lambda: self.set_bg_menu_type("black"))
         self.bg_menu.add_command(label="   Solid White", command=lambda: self.set_bg_menu_type("white"))
-        self.bg_menu.add_command(label="   Custom Background Image...", command=lambda: self.set_bg_menu_type("custom"))
+        self.bg_menu.add_command(label="   Custom Background...", command=lambda: self.set_bg_menu_type("custom"))
 
         self.options_menu.add_separator()
 
@@ -408,7 +410,7 @@ class SIGMAFLIP:
 
         # Option for Advanced Filter Settings
         self.options_menu.add_command(
-            label="Advanced Rendering Settings...",
+            label="Advanced Filters...",
             command=self.show_advanced_settings
         )
         
@@ -437,7 +439,7 @@ class SIGMAFLIP:
 
         self.bg_menu.entryconfigure(0, label="✓ Solid Black (Default)" if self.bg_type_var.get() == "black" else "   Solid Black (Default)")
         self.bg_menu.entryconfigure(1, label="✓ Solid White" if self.bg_type_var.get() == "white" else "   Solid White")
-        self.bg_menu.entryconfigure(2, label="✓ Custom Background Image..." if self.bg_type_var.get() == "custom" else "   Custom Background Image...")
+        self.bg_menu.entryconfigure(2, label="✓ Custom Background..." if self.bg_type_var.get() == "custom" else "   Custom Background...")
 
     def set_struct_menu_type(self, struct_type):
         """Sets export folder directory structure options, updating high-contrast ticks."""
@@ -544,6 +546,8 @@ class SIGMAFLIP:
                     pass
             self.temp_audio_path = None
             self.has_audio = False
+            self._music_paused = False
+            self._music_pos_anchor = 0
 
     def poll_appearance_mode(self):
         """Safely polls CustomTkinter's appearance mode state to trigger native redrawing on theme changes."""
@@ -1253,7 +1257,7 @@ class SIGMAFLIP:
             self.options_menu.entryconfigure(0, label="✓ Enable Audio Preview" if self.audio_enabled else "   Enable Audio Preview")
             self.bg_menu.entryconfigure(0, label="✓ Solid Black (Default)" if self.bg_type == "black" else "   Solid Black (Default)")
             self.bg_menu.entryconfigure(1, label="✓ Solid White" if self.bg_type == "white" else "   Solid White")
-            self.bg_menu.entryconfigure(2, label="✓ Custom Background Image..." if self.bg_type == "custom" else "   Custom Background Image...")
+            self.bg_menu.entryconfigure(2, label="✓ Custom Background..." if self.bg_type == "custom" else "   Custom Background...")
             self.struct_menu.entryconfigure(0, label="✓ Native DCIM (10XNIN01)" if self.export_structure == "dcim" else "   Native DCIM (10XNIN01)")
             self.struct_menu.entryconfigure(1, label="✓ Sequential Parts (Part_X)" if self.export_structure == "parts" else "   Sequential Parts (Part_X)")
 
@@ -1419,6 +1423,8 @@ class SIGMAFLIP:
                 pass
         self.temp_audio_path = None
         self.has_audio = False
+        self._music_paused = False
+        self._music_pos_anchor = 0
 
         if value == "Singular Image":
             self.current_singular_view = "preview"
@@ -1476,7 +1482,7 @@ class SIGMAFLIP:
 
         # Standard Video Processing
         file_path = filedialog.askopenfilename(
-            filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv *.gif *.webm")]
+            filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv *.gif")]
         )
         if not file_path:
             self.play_sound('back.mp3')
@@ -1499,6 +1505,8 @@ class SIGMAFLIP:
                 pass
         self.temp_audio_path = None
         self.has_audio = False
+        self._music_paused = False
+        self._music_pos_anchor = 0
 
         self.video_path = file_path
         self.image_paths = []
@@ -1901,6 +1909,13 @@ class SIGMAFLIP:
     def on_slider_scrub(self, val):
         self.current_frame_idx = float(val)
         self.update_frame_display()
+        if self._music_paused:
+            # Seek invalidates the paused audio position; resume must restart from here
+            try:
+                pygame.mixer.music.stop()
+            except Exception:
+                pass
+            self._music_paused = False
 
     def toggle_play(self):
         if not self.cap or (self.export_mode_var.get() == "Singular Image"):
@@ -1913,7 +1928,9 @@ class SIGMAFLIP:
             
             try:
                 pygame.mixer.music.pause()
+                self._music_paused = True
             except Exception:
+                self._music_paused = False
                 pass
 
             if self.after_play_id:
@@ -1934,13 +1951,23 @@ class SIGMAFLIP:
             self.playback_tick()
 
     def start_audio_at_current_frame(self):
-        """Plays extracted WAV track starting precisely at current timeline position."""
-        if self.audio_enabled and self.has_audio:
-            start_sec = self.current_frame_idx / self.video_fps
+        """Resumes paused WAV track, or restarts it at the current timeline position."""
+        if not (self.audio_enabled and self.has_audio):
+            return
+        if self._music_paused:
             try:
-                pygame.mixer.music.play(start=start_sec)
+                pygame.mixer.music.unpause()
+                self._music_paused = False
+                self._music_pos_anchor = pygame.mixer.music.get_pos()
+                return
             except Exception:
-                pass
+                self._music_paused = False
+        start_sec = self.current_frame_idx / self.video_fps
+        try:
+            pygame.mixer.music.play(start=start_sec)
+            self._music_pos_anchor = 0
+        except Exception:
+            pass
 
     def playback_tick(self):
         if not self.playing:
@@ -1953,7 +1980,7 @@ class SIGMAFLIP:
         if self.audio_enabled and self.has_audio:
             music_pos = pygame.mixer.music.get_pos()
             if music_pos != -1:
-                self.current_frame_idx = self._playback_start_frame + (music_pos / 1000.0) * self.video_fps
+                self.current_frame_idx = self._playback_start_frame + ((music_pos - self._music_pos_anchor) / 1000.0) * self.video_fps
             else:
                 self.current_frame_idx = self._playback_start_frame + (elapsed * self.video_fps)
         else:
@@ -1963,6 +1990,7 @@ class SIGMAFLIP:
             self.current_frame_idx = 0.0
             self._playback_start_time = time.time()
             self._playback_start_frame = 0.0
+            self._music_paused = False
             self.start_audio_at_current_frame()
 
         self.timeline_slider.set(int(self.current_frame_idx))
@@ -2340,7 +2368,7 @@ class SIGMAFLIP:
                     ffmpeg_path, "-y", 
                     "-i", self.video_path,
                     "-i", self.bg_image_path,
-                    "-vsync", "cfr",
+                    "-fps_mode", "cfr",
                     "-filter_complex", filter_complex,
                     "-q:v", "2", os.path.join(output_dir, "HNI_%04d.JPG")
                 ]
@@ -2349,7 +2377,7 @@ class SIGMAFLIP:
                 vf_filter = f"fps={target_fps},scale=640:480:force_original_aspect_ratio=decrease,pad=640:480:(ow-iw)/2:(oh-ih)/2:color={color_str}"
                 cmd = [
                     ffmpeg_path, "-y", "-i", self.video_path,
-                    "-vsync", "cfr",
+                    "-fps_mode", "cfr",
                     "-vf", vf_filter, 
                     "-q:v", "2", os.path.join(output_dir, "HNI_%04d.JPG")
                 ]
@@ -2366,7 +2394,7 @@ class SIGMAFLIP:
                 
             cmd = [
                 ffmpeg_path, "-y", "-i", self.video_path,
-                "-vsync", "cfr",
+                "-fps_mode", "cfr",
                 "-vf", vf_filter, 
                 "-q:v", "2", os.path.join(output_dir, "HNI_%04d.JPG")
             ]
