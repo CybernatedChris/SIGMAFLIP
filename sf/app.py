@@ -144,7 +144,10 @@ class SIGMAFLIP:
         self._tooltip_win = None
 
         # Configuration Persistence Location
-        self.config_filepath = os.path.join(os.path.expanduser("~"), ".sigmaflip_config.json")
+        # When frozen, __file__ lives in the read-only _MEIPASS temp dir, so
+        # persist next to the executable instead of inside it.
+        config_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.config_filepath = os.path.join(config_dir, ".sigmaflip_config.json")
 
         # Session Parameter Variable Bindings (Fully restored to prevent attribute exceptions)
         self.bg_type_var = tk.StringVar(value="black")
