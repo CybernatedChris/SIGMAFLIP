@@ -8,7 +8,7 @@ def show_about_dialog(parent, fonts, icon_path, main_color, sub_color, highlight
     """Generates a styled, centered About window with transparent grid backgrounds [sf/about.py]."""
     about = ctk.CTkToplevel(parent)
     about.title("About SIGMAFLIP")
-    about.geometry("440x480")
+    about.geometry("440x580")
     about.resizable(False, False)
     about.transient(parent)
     about.grab_set()
@@ -87,7 +87,7 @@ def show_about_dialog(parent, fonts, icon_path, main_color, sub_color, highlight
     disclaimer_text = (
         "DISCLAIMER: CybernatedChris assume no responsibility for how SIGMAFLIP is handled. "
         "You are solely responsible for the content you export. Improper use of files "
-        "on Nintendo DSi/3DS online networks can result in severe consequences, "
+        "on Nintendo DSi fan services can result in severe consequences, "
         "including permanent system bans or administrative restrictions. "
         "With great power comes great responsibility. Please proceed entirely at your own risk."
     )
@@ -97,6 +97,19 @@ def show_about_dialog(parent, fonts, icon_path, main_color, sub_color, highlight
         text=disclaimer_text,
         font=fonts['tiny'],
         text_color="#f87171",
+        wraplength=360,
+        justify="center",
+        fg_color="transparent"
+    ).pack(padx=10, pady=8)
+
+    secondary_frame = ctk.CTkFrame(frame, fg_color="transparent", border_color="#fbbf24", border_width=1)
+    secondary_frame.pack(fill="x", pady=(0, 10))
+
+    ctk.CTkLabel(
+        secondary_frame,
+        text="This tool signs VIDEO FRAMES and PICTURES, NOT Flipnote PPM files!",
+        font=fonts['tiny'],
+        text_color="#fbbf24",
         wraplength=360,
         justify="center",
         fg_color="transparent"
