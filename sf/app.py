@@ -9,6 +9,7 @@ import threading
 import subprocess
 import tempfile
 import math
+import struct
 import cv2
 import pygame
 import tkinter as tk
@@ -157,13 +158,15 @@ class SIGMAFLIP:
         self.audio_enabled = True
         self.bg_type = "black"
         self.export_structure = "dcim"
+        self.console_type = "dsi"
 
         # Advanced Filter Configuration State (Default fallback values)
         self.advanced_settings = {
             "pixel_precision": False,
             "black_and_white": False,
             "contrast": 1.0,
-            "dither_mode": "None"
+            "dither_mode": "None",
+            "album_capacity": 100
         }
 
         # Pygame Mixer Setup for sound effects
@@ -406,14 +409,23 @@ class SIGMAFLIP:
         self.struct_menu = tk.Menu(self.options_menu, tearoff=0, **menu_opts)
         self.options_menu.add_cascade(label="Export Folder Structure", menu=self.struct_menu)
 
-        self.struct_menu.add_command(label="✓ Native DCIM (10XNIN01)", command=lambda: self.set_struct_menu_type("dcim"))
+        self.struct_menu.add_command(label="✓ Native DCIM (10XNIN01/NIN02)", command=lambda: self.set_struct_menu_type("dcim"))
         self.struct_menu.add_command(label="   Sequential Parts (Part_X)", command=lambda: self.set_struct_menu_type("parts"))
+
+        self.options_menu.add_separator()
+
+        # Cascade Menu for Target Console
+        self.console_menu = tk.Menu(self.options_menu, tearoff=0, **menu_opts)
+        self.options_menu.add_cascade(label="Target Console", menu=self.console_menu)
+
+        self.console_menu.add_command(label="✓ Nintendo DSi", command=lambda: self.set_console_type("dsi"))
+        self.console_menu.add_command(label="   Nintendo 3DS", command=lambda: self.set_console_type("3ds"))
 
         self.options_menu.add_separator()
 
         # Option for Advanced Filter Settings
         self.options_menu.add_command(
-            label="Advanced Filters...",
+            label="Advanced Settings...",
             command=self.show_advanced_settings
         )
         
@@ -450,8 +462,56 @@ class SIGMAFLIP:
         self.export_structure_var.set(struct_type)
         self.on_struct_type_change()
 
-        self.struct_menu.entryconfigure(0, label="✓ Native DCIM (10XNIN01)" if self.export_structure_var.get() == "dcim" else "   Native DCIM (10XNIN01)")
+        self.struct_menu.entryconfigure(0, label="✓ Native DCIM (10XNIN01/NIN02)" if self.export_structure_var.get() == "dcim" else "   Native DCIM (10XNIN01/NIN02)")
         self.struct_menu.entryconfigure(1, label="✓ Sequential Parts (Part_X)" if self.export_structure_var.get() == "parts" else "   Sequential Parts (Part_X)")
+
+    def set_console_type(self, console_type):
+        """Sets the target console, updating high-contrast checkmarks."""
+        self.console_type = console_type
+        self.console_menu.entryconfigure(0, label="✓ Nintendo DSi" if self.console_type == "dsi" else "   Nintendo DSi")
+        self.console_menu.entryconfigure(1, label="✓ Nintendo 3DS" if self.console_type == "3ds" else "   Nintendo 3DS")
+        self.struct_menu.entryconfigure(
+            0,
+            label="✓ Native DCIM (10XNIN01/NIN02)" if self.export_structure == "dcim" else "   Native DCIM (10XNIN01/NIN02)"
+        )
+
+    def _get_dsi_folder_suffix(self):
+        """Get the folder suffix used by the DSi/3DS Camera album in DCIM."""
+        return "NIN02"
+
+    def _prompt_pit_deletion(self, pit):
+        """Ask on the main thread whether to delete the stale album cache.
+        Blocks the worker thread until the user answers."""
+        result = [False]
+        done = threading.Event()
+        def ask():
+            try:
+                result[0] = messagebox.askyesno(
+                    "Delete album cache?",
+                    f"A stale photo album cache was found at:\n{pit}\n\n"
+                    "Delete it now so the console re-scans the new photos?")
+            finally:
+                done.set()
+        self.root.after(0, ask)
+        done.wait()
+        return result[0]
+
+    def _cleanup_dsi_album_cache(self, export_dir):
+        """Delete the stale camera album cache so the console re-scans the new photos.
+        The DSi photo format is region-free (GBATEK) and the camera app folder code
+        is 'HNIJ' (484E494A) on every region, so this path is universal.
+        Only runs when exporting to the SD card root in DSi mode.
+        Returns a short note about what was cleaned, or '' if nothing to do."""
+        pit = os.path.join(export_dir, "private", "ds", "app", "484E494A", "pit.bin")
+        if not os.path.isfile(pit):
+            return ""
+        if not self._prompt_pit_deletion(pit):
+            return ""
+        try:
+            os.unlink(pit)
+        except Exception:
+            return ""
+        return f"\nDeleted stale album cache: {pit}"
 
     def select_custom_bg_image(self):
         """Launches file selector for custom image backgrounds on resized crops."""
@@ -526,7 +586,9 @@ class SIGMAFLIP:
             highlight_color=self.highlight_color_adaptive,
             settings=self.advanced_settings,
             on_change_callback=self.update_frame_display,
-            set_icon_fn=self._set_window_icon # Pass icon binder natively!
+            get_export_structure=lambda: self.export_structure,
+            get_console_type=lambda: self.console_type,
+            set_icon_fn=self._set_window_icon
         )
 
     def on_audio_toggle(self):
@@ -1253,6 +1315,7 @@ class SIGMAFLIP:
             self.bg_type = config.get("bg_type", "black")
             self.bg_image_path = config.get("bg_image_path", None)
             self.export_structure = config.get("export_structure", "dcim")
+            self.console_type = config.get("console_type", "dsi")
             self.bg_type_var.set(self.bg_type)
             self.export_structure_var.set(self.export_structure)
             
@@ -1261,8 +1324,10 @@ class SIGMAFLIP:
             self.bg_menu.entryconfigure(0, label="✓ Solid Black (Default)" if self.bg_type == "black" else "   Solid Black (Default)")
             self.bg_menu.entryconfigure(1, label="✓ Solid White" if self.bg_type == "white" else "   Solid White")
             self.bg_menu.entryconfigure(2, label="✓ Custom Background..." if self.bg_type == "custom" else "   Custom Background...")
-            self.struct_menu.entryconfigure(0, label="✓ Native DCIM (10XNIN01)" if self.export_structure == "dcim" else "   Native DCIM (10XNIN01)")
+            self.struct_menu.entryconfigure(0, label="✓ Native DCIM (10XNIN01/NIN02)" if self.export_structure == "dcim" else "   Native DCIM (10XNIN01/NIN02)")
             self.struct_menu.entryconfigure(1, label="✓ Sequential Parts (Part_X)" if self.export_structure == "parts" else "   Sequential Parts (Part_X)")
+            self.console_menu.entryconfigure(0, label="✓ Nintendo DSi" if self.console_type == "dsi" else "   Nintendo DSi")
+            self.console_menu.entryconfigure(1, label="✓ Nintendo 3DS" if self.console_type == "3ds" else "   Nintendo 3DS")
 
             # Map scaling parameters back to OptionMenu representations
             scale_modes_map = {
@@ -1299,6 +1364,7 @@ class SIGMAFLIP:
                 "bg_type": self.bg_type,
                 "bg_image_path": self.bg_image_path if self.bg_image_path else "",
                 "export_structure": self.export_structure,
+                "console_type": self.console_type,
                 "scale_mode": self.scale_mode,
                 "advanced_settings": self.advanced_settings
             }
@@ -1683,7 +1749,8 @@ class SIGMAFLIP:
             return
 
         target_fps = SPEED_FPS[self.speed]
-        estimated_frames = math.ceil(self.total_video_frames * target_fps / self.video_fps)
+        frame_step = max(1, round(self.video_fps / target_fps))
+        estimated_frames = (self.total_video_frames - 1) // frame_step + 1
 
         # Trigger message box dialog block only when requested
         if show_popup and self.video_duration > WARNING_DURATION:
@@ -1977,6 +2044,7 @@ class SIGMAFLIP:
             return
 
         target_fps = SPEED_FPS[self.speed]
+        frame_step = max(1, round(self.video_fps / target_fps))
         elapsed = time.time() - self._playback_start_time
         
         # Audio Hybrid Sync calculation keeps frame increments and Pygame timeline locked in 1:1 sync
@@ -1988,7 +2056,12 @@ class SIGMAFLIP:
                 self.current_frame_idx = self._playback_start_frame + (elapsed * self.video_fps)
         else:
             self.current_frame_idx = self._playback_start_frame + (elapsed * self.video_fps)
-        
+
+        # Snapshot the exported frame indices (select every Nth frame) so the preview
+        # always shows exactly the frames the pipeline will convert.
+        if frame_step > 1:
+            self.current_frame_idx = int(self.current_frame_idx // frame_step) * frame_step
+
         if self.current_frame_idx >= self.total_video_frames:
             self.current_frame_idx = 0.0
             self._playback_start_time = time.time()
@@ -1999,115 +2072,82 @@ class SIGMAFLIP:
         self.timeline_slider.set(int(self.current_frame_idx))
         self.update_frame_display()
 
-        # Keeps rendering updates locked precisely to the targeted Flipnote choppy speed
-        delay_ms = int(1000 / target_fps)
+        # Self-correcting timer: fire at the next whole interval boundary so cumulative
+        # callback lag never drifts the preview ahead of the converted frames.
+        interval = 1.0 / target_fps
+        next_at = interval * (math.floor(elapsed / interval) + 1)
+        delay_ms = max(0, int((next_at - elapsed) * 1000))
         self.after_play_id = self.root.after(delay_ms, self.playback_tick)
 
     DSI_SIG_PADDING = 512  # bytes of COM comment padding for signature area
+    DSI_JPEG_KEY = bytes.fromhex("70885206DFE5016D45EAC52333D6446F")  # DSi photo AES key (from DSi bootrom)
+    DSI_NATIVE_W = 256
+    DSI_NATIVE_H = 192
+    
 
     def _gf_mul2(self, block):
         """GF(2^128) multiply by 2; matches dsi_jpeg_signature_tool's weird_func exactly."""
-        b0 = int.from_bytes(block[0:4], 'little')
-        b1 = int.from_bytes(block[4:8], 'little')
-        b2 = int.from_bytes(block[8:12], 'little')
-        b3 = int.from_bytes(block[12:16], 'little')
-        tmp = b3
-        new_b3 = ((b3 << 1) | (b2 >> 31)) & 0xFFFFFFFF
-        new_b2 = ((b1 << 1) | (b0 >> 31)) & 0xFFFFFFFF
-        new_b1 = new_b2  # intentional bug in reference C code
-        new_b0 = (b0 * 2) & 0xFFFFFFFF
-        if tmp >> 31:
-            new_b0 ^= 0x87
-        res = bytearray(16)
-        res[0:4] = new_b0.to_bytes(4, 'little')
-        res[4:8] = new_b1.to_bytes(4, 'little')
-        res[8:12] = new_b2.to_bytes(4, 'little')
-        res[12:16] = new_b3.to_bytes(4, 'little')
-        return bytes(res)
+        x = int.from_bytes(block, 'little')
+        y = (x << 1) & ((1 << 128) - 1)
+        if x >> 127:
+            y ^= 0x87
+        return y.to_bytes(16, 'little')
 
-    def sign_jpeg_dsi(self, data: bytes) -> bytes:
-        """Embed AES-128-CCM signature at JPEG offsets 0x18A/0x196 for DSi/3DS recognition."""
-        eoi = data.rfind(b'\xFF\xD9')
-        if eoi != -1:
-            data = data[:eoi + 2] + b'\x00' * 32
-        else:
-            data = data + b'\x00' * 32
-
-        if len(data) < 0x1A6:
-            data = data + b'\x00' * (0x1A6 - len(data))
-
-        buf = bytearray(data)
-        size = len(data)
-        total_size = (size + 15) & ~15
-        buf.extend(b'\x00' * (total_size - size))
-
-        nonce = get_random_bytes(12)
-        key = b"pTo84jT9nBw1QmOp"
+    def _dsi_ccm_tag(self, data: bytes, nonce: bytes) -> bytes:
+        """AES-128-CCM MAC over the whole JPEG with the 1Ch signature slot zeroed,
+        using the byte-reversed variant and CMAC tail-block transform that the
+        DSi photo app actually verifies (matches dsi_jpeg_signature_tool main.c)."""
+        key = self.DSI_JPEG_KEY
         rev_key = key[::-1]
         ecb = AES.new(rev_key, AES.MODE_ECB)
 
-        # Zero out the signature slot before CCM
+        size = len(data)
+        total_size = (size + 15) & ~15
+        buf = bytearray(data)
+        buf.extend(b'\x00' * (total_size - size))
         buf[0x18A:0x1A6] = b'\x00' * 0x1C
 
-        # CCM authentication (byte-reversed variant matching 3DS expectation)
-        flags = 0xC2
-        b0 = bytes([flags]) + nonce[::-1] + b'\x00\x00\x00'
-        mac_state = ecb.encrypt(b0)
+        block = ecb.encrypt(b'\x00' * 16)[::-1]
+        block = self._gf_mul2(block)
+        final_bytes = ((size - 1) & 0xF) + 1
+        if final_bytes == 0x10:
+            # Reference only applies gf_mul2 once before this branch; the last
+            # aligned block is xored in directly (main.c final_bytes == 0x10).
+            block = bytes(a ^ b for a, b in zip(block, bytes(buf[size - 16:size])))
+        else:
+            tmp = bytearray(16)
+            tmp[16 - final_bytes:] = buf[size - final_bytes:size]
+            tmp[15 - final_bytes] = 0x80
+            block = bytes(a ^ b for a, b in zip(self._gf_mul2(block), bytes(tmp)))
+        buf[size - final_bytes:size - final_bytes + 16] = block
 
+        b0 = bytes([0x7A]) + nonce[::-1] + b'\x00\x00\x00'
+        mac_state = ecb.encrypt(b0)
         for off in range(0, total_size, 16):
-            blk = bytes(buf[off:off + 16])
-            rev = blk[::-1]
-            xored = bytes(a ^ b for a, b in zip(rev, mac_state))
-            mac_state = ecb.encrypt(xored)
+            blk = bytes(buf[off:off + 16])[::-1]
+            mac_state = ecb.encrypt(bytes(a ^ b for a, b in zip(blk, mac_state)))
 
         ctr = bytes([2]) + nonce[::-1] + b'\x00\x00\x00'
         s0 = ecb.encrypt(ctr)[::-1]
+        return bytes(a ^ b for a, b in zip(mac_state[::-1], s0))
 
-        rev_mac = mac_state[::-1]
-        tag = bytes(a ^ b for a, b in zip(rev_mac, s0))
-
-        buf[0x18A:0x18A + 12] = nonce
-        buf[0x196:0x196 + 16] = tag
-        return bytes(buf[:size])
+    def sign_jpeg_dsi(self, data: bytes) -> bytes:
+        """Embed the genuine DSi AES-128-CCM signature (IV at 0x18A, MAC at 0x196)."""
+        nonce = get_random_bytes(12)
+        tag = self._dsi_ccm_tag(data, nonce)
+        out = bytearray(data)
+        out[0x18A:0x18A + 12] = nonce
+        out[0x196:0x196 + 16] = tag
+        return bytes(out)
 
     def verify_dsi_signature(self, data: bytes) -> bool:
-        """Programmatically validates the AES-128-CCM signature of a generated JPEG file."""
+        """Programmatically validates the DSi AES-128-CCM signature of a generated JPEG file."""
         try:
             if len(data) < 0x1A6:
                 return False
-
-            buf = bytearray(data)
-
-            nonce = bytes(buf[0x18A:0x18A + 12])
-            tag_stored = bytes(buf[0x196:0x196 + 16])
-
-            buf[0x18A:0x1A6] = b'\x00' * 0x1C
-
-            size = len(data)
-            total_size = (size + 15) & ~15
-            buf.extend(b'\x00' * (total_size - size))
-
-            key = b"pTo84jT9nBw1QmOp"
-            rev_key = key[::-1]
-            ecb = AES.new(rev_key, AES.MODE_ECB)
-
-            flags = 0xC2
-            b0 = bytes([flags]) + nonce[::-1] + b'\x00\x00\x00'
-            mac_state = ecb.encrypt(b0)
-
-            for off in range(0, total_size, 16):
-                blk = bytes(buf[off:off + 16])
-                rev = blk[::-1]
-                xored = bytes(a ^ b for a, b in zip(rev, mac_state))
-                mac_state = ecb.encrypt(xored)
-
-            ctr = bytes([2]) + nonce[::-1] + b'\x00\x00\x00'
-            s0 = ecb.encrypt(ctr)[::-1]
-
-            rev_mac = mac_state[::-1]
-            tag_calculated = bytes(a ^ b for a, b in zip(rev_mac, s0))
-
-            return tag_stored == tag_calculated
+            nonce = bytes(data[0x18A:0x18A + 12])
+            tag_stored = bytes(data[0x196:0x196 + 16])
+            return self._dsi_ccm_tag(data, nonce) == tag_stored
         except Exception:
             return False
 
@@ -2120,34 +2160,116 @@ class SIGMAFLIP:
         except Exception:
             return False
 
+    def build_dsi_exif(self, time_str: str, thumb_jpeg: bytes) -> bytes:
+        """Builds the DSi APP1 Exif payload (big-endian TIFF) with a MakerNote whose
+        0x1000 tag points to the 1Ch signature slot at TIFF offset 0x17E (= file 0x18A)."""
+        def be16(v):
+            return struct.pack(">H", v)
+        def be32(v):
+            return struct.pack(">I", v)
+
+        # IFD0 at 0x08 -> 0x7A
+        ifd0 = bytearray(2 + 9 * 12 + 4)
+        ifd0[0:2] = be16(9)
+        entries0 = [
+            (0x010F, 2, 9, 0x7A), (0x0110, 2, 11, 0x84), (0x011A, 5, 1, 0x90),
+            (0x011B, 5, 1, 0x98), (0x0128, 3, 1, 0x00020000), (0x0131, 2, 5, 0xA0),
+            (0x0132, 2, 20, 0xA6), (0x0213, 3, 1, 0x00020000), (0x8769, 4, 1, 0xBA),
+        ]
+        for i, (t, ty, c, v) in enumerate(entries0):
+            struct.pack_into(">HHII", ifd0, 2 + i * 12, t, ty, c, v)
+        ifd0[2 + 9 * 12:2 + 9 * 12 + 4] = be32(0x1DE)
+
+        # Sub IFD at 0xBA -> 0x138
+        sub = bytearray(2 + 10 * 12 + 4)
+        sub[0:2] = be16(10)
+        entries_sub = [
+            (0x9000, 7, 4, 0x30323230), (0x9003, 2, 20, 0x138), (0x9004, 2, 20, 0x14C),
+            (0x9101, 7, 4, 0x01020300), (0x927C, 7, 66, 0x160), (0xA000, 7, 4, 0x30313030),
+            (0xA001, 3, 1, 0x00010000), (0xA002, 4, 1, 0x280), (0xA003, 4, 1, 0x1E0),
+            (0xA005, 4, 1, 0x1A2),
+        ]
+        for i, (t, ty, c, v) in enumerate(entries_sub):
+            struct.pack_into(">HHII", sub, 2 + i * 12, t, ty, c, v)
+        sub[2 + 10 * 12:2 + 10 * 12 + 4] = be32(0)
+
+        # MakerNote at 0x160 -> 0x17E
+        mn = bytearray(2 + 2 * 12 + 4)
+        mn[0:2] = be16(2)
+        entries_mn = [(0x1000, 7, 0x1C, 0x17E), (0x1001, 7, 8, 0x19A)]
+        for i, (t, ty, c, v) in enumerate(entries_mn):
+            struct.pack_into(">HHII", mn, 2 + i * 12, t, ty, c, v)
+        mn[2 + 2 * 12:2 + 2 * 12 + 4] = be32(0)
+
+        # Interop IFD at 0x1A2 -> 0x1CC
+        interop = bytearray(2 + 3 * 12 + 4)
+        interop[0:2] = be16(3)
+        entries_int = [
+            (0x0001, 2, 4, 0x52393800), (0x0002, 7, 4, 0x30313030), (0x1000, 2, 18, 0x1CC),
+        ]
+        for i, (t, ty, c, v) in enumerate(entries_int):
+            struct.pack_into(">HHII", interop, 2 + i * 12, t, ty, c, v)
+        interop[2 + 3 * 12:2 + 3 * 12 + 4] = be32(0)
+
+        # IFD1 (thumbnail) at 0x1DE -> 0x22C
+        ifd1 = bytearray(2 + 6 * 12 + 4)
+        ifd1[0:2] = be16(6)
+        entries_ifd1 = [
+            (0x0103, 3, 1, 0x00060000), (0x011A, 5, 1, 0x22C), (0x011B, 5, 1, 0x234),
+            (0x0128, 3, 1, 0x00020000), (0x0201, 4, 1, 0x23C), (0x0202, 4, 1, len(thumb_jpeg)),
+        ]
+        for i, (t, ty, c, v) in enumerate(entries_ifd1):
+            struct.pack_into(">HHII", ifd1, 2 + i * 12, t, ty, c, v)
+        ifd1[2 + 6 * 12:2 + 6 * 12 + 4] = be32(0)
+
+        dt = time_str.encode() + b'\x00'
+        tiff = (
+            b"MM\x00\x2A" + be32(8) +
+            bytes(ifd0) +
+            b"Nintendo\x00\x00" + b"NintendoDS\x00\x00" +
+            be32(72) + be32(1) + be32(72) + be32(1) +
+            b"EINH\x00\x00" + dt +
+            bytes(sub) + dt + dt +
+            bytes(mn) +
+            b'\x00' * 0x1C + b'\x00' * 8 +
+            bytes(interop) + b"JPEG Exif Ver 2.2\x00" +
+            bytes(ifd1) +
+            be32(72) + be32(1) + be32(72) + be32(1) +
+            thumb_jpeg
+        )
+        assert len(tiff) == 0x23C + len(thumb_jpeg)
+        payload = b"Exif\x00\x00" + tiff
+        return be16(len(payload) + 2) + payload
+
     def encode_and_sign_frame_safe(self, pil_img, time_str, target_path) -> bool:
         """Encodes, signs, and programmatically verifies a frame.
         If verification fails or the file size is too large for the 3DS memory limits,
         it dynamically adjusts encoding parameters to secure a valid, lightweight file."""
         quality = 95
-        comment_len = 512
         MAX_FILE_SIZE = 140000  # 140 KB limit to prevent 3DS decoder out-of-memory errors
 
         for attempt in range(6):
             img_copy = pil_img.copy()
             img_copy.info.clear()
 
-            exif = Image.Exif()
-            exif[306] = time_str
-            exif[36867] = time_str
-            exif[36868] = time_str
-
-            buf = io.BytesIO()
+            # Both DSi and 3DS read the same signed DSi photo format from DCIM,
+            # so there is a single encoding path (custom APP1 Exif with MakerNote
+            # signature slot + thumbnail), always signed with the DSi key.
             try:
+                thumb_buf = io.BytesIO()
+                img_copy.resize((160, 120), Image.LANCZOS).convert("RGB").save(
+                    thumb_buf, format="JPEG", quality=75, subsampling=2)
+                main_buf = io.BytesIO()
                 img_copy.convert("RGB").save(
-                    buf,
-                    format="JPEG",
-                    exif=exif,
-                    quality=quality,
-                    subsampling=0,
-                    comment=b'\x00' * comment_len
-                )
-                img_data = buf.getvalue()
+                    main_buf, format="JPEG", quality=quality, subsampling=0)
+                mdata = main_buf.getvalue()
+                # Keep the whole body after SOI: slicing from the SOF marker would
+                # drop the DQT quantization tables (libjpeg decodes anyway using
+                # defaults, but the DSi hardware decoder needs them and renders
+                # the full-screen view as gray without them).
+                body = mdata[2:]
+                app1 = b"\xFF\xE1" + self.build_dsi_exif(time_str, thumb_buf.getvalue())
+                img_data = b"\xFF\xD8" + app1 + body
             except Exception:
                 quality -= 5
                 continue
@@ -2168,71 +2290,79 @@ class SIGMAFLIP:
             else:
                 quality -= 3
 
-            comment_len = 512 - (attempt * 16)
-
         signed_data = self.sign_jpeg_dsi(img_data)
         with open(target_path, "wb") as f:
             f.write(signed_data)
         return False
+
+    def _sign_and_partition(self, output_dir, sources, base_time, remove_sources=False):
+        """Sign and partition exported frames into the selected structure.
+        DCIM mode: frames are split into batches of `album_capacity`. Each batch
+        goes to its own root folder DCIM/, DCIM_2/, ..., with folder numbering
+        restarted (100NINxx) per batch. Within a batch, subfolders hold up to
+        100 frames each and HNI_xxxx wraps back to 0001 per subfolder, matching
+        the DSi album layout. Parts mode keeps the existing Part_X
+        layout.
+        Returns (signed_count, folder_set_count)."""
+        batch_size = max(1, int(self.advanced_settings.get("album_capacity", 100)))
+        dsi_suffix = self._get_dsi_folder_suffix() if self.console_type == "dsi" else "NIN01"
+        use_parts = (self.export_structure == "parts")
+
+        total = len(sources)
+        signed_count = 0
+        folder_sets = 0
+        frame_index = 0
+
+        if use_parts:
+            batches = [("", sources)]
+        else:
+            batches = []
+            for i in range(0, total, batch_size):
+                label = "DCIM" if i == 0 else f"DCIM_{i // batch_size + 1}"
+                batches.append((label, sources[i:i + batch_size]))
+
+        for batch_label, batch in batches:
+            for part_idx, chunk in enumerate([batch[i:i + 100] for i in range(0, len(batch), 100)]):
+                if use_parts:
+                    part_dir = os.path.join(output_dir, f"Part_{part_idx + 1}")
+                else:
+                    part_dir = os.path.join(output_dir, batch_label, f"{100 + part_idx}{dsi_suffix}")
+                os.makedirs(part_dir, exist_ok=True)
+                folder_sets += 1
+                for file_idx, src in enumerate(chunk):
+                    frame_time = base_time + frame_index * 2
+                    time_str = time.strftime("%Y:%m:%d %H:%M:%S", time.localtime(frame_time))
+                    out_filename = f"HNI_{file_idx + 1:04d}.JPG"
+                    new_filepath = os.path.join(part_dir, out_filename)
+                    try:
+                        with Image.open(src) as img:
+                            img_processed = self.apply_scaling_to_image(img, 640, 480)
+                            img_processed.info.clear()
+                            self.encode_and_sign_frame_safe(img_processed, time_str, new_filepath)
+                        if remove_sources and os.path.exists(src):
+                            os.unlink(src)
+                        os.utime(new_filepath, (frame_time, frame_time))
+                        signed_count += 1
+                    except Exception as e:
+                        print(f"Error processing {os.path.basename(src)} inside {os.path.basename(part_dir)}: {e}")
+                    self.root.after(0, lambda p=(signed_count / max(1, total)): self.progress_bar.set(p))
+                    frame_index += 1
+        return signed_count, folder_sets
 
     def run_batch_image_export_pipeline(self, output_dir):
         """Asynchronously processes, timestamps, and signs multiple still images [sf/app.py]."""
         try:
             self._exporting = True
             base_time = time.time()
-            total_files = len(self.image_paths)
-            frames_per_part = 100  # Group limit for directory sets [sf/app.py]
-            
-            # Chunk matching paths lists into groups of 100
-            chunks = [self.image_paths[i:i + frames_per_part] for i in range(0, total_files, frames_per_part)]
-            processed_count = 0
-            
-            # Resolve directory structure options on-the-fly [app.py]
-            use_parts = (self.export_structure == "parts")
-            if not use_parts:
-                dcim_dir = os.path.join(output_dir, "DCIM")
-                os.makedirs(dcim_dir, exist_ok=True)
-            
-            for part_idx, chunk in enumerate(chunks):
-                # Apply either native naming or standard Part folders [app.py]
-                if use_parts:
-                    part_name = f"Part_{part_idx + 1}"
-                    part_dir = os.path.join(output_dir, part_name)
-                else:
-                    part_num = 100 + part_idx
-                    part_name = f"{part_num}NIN01"
-                    part_dir = os.path.join(dcim_dir, part_name)
-                os.makedirs(part_dir, exist_ok=True)
-                
-                for file_idx, filepath in enumerate(chunk):
-                    frame_time = base_time + (processed_count * 2)
-                    time_str = time.strftime("%Y:%m:%d %H:%M:%S", time.localtime(frame_time))
-                    
-                    # Apply index structures [app.py]
-                    if use_parts:
-                        out_filename = f"HNI_{file_idx + 1:04d}.JPG"  # Resets to 0001 per folder
-                    else:
-                        out_filename = f"HNI_{processed_count + 1:04d}.JPG"  # Globally sequential index
-                        
-                    target_file = os.path.join(part_dir, out_filename)
-                    
-                    # Scale still frame using sharp NEAREST interpolation and convert with transparent alpha preserved [app.py]
-                    pil_img = Image.open(filepath).convert("RGBA")
-                    pil_img = self.apply_scaling_to_image(pil_img, 640, 480)
-                    
-                    self.encode_and_sign_frame_safe(pil_img, time_str, target_file)
-                    
-                    os.utime(target_file, (frame_time, frame_time))
-                    processed_count += 1
-                    
-                    # Pass increment progress values
-                    progress_val = processed_count / total_files
-                    self.root.after(0, lambda p=progress_val: self.progress_bar.set(p))
-                
+            signed_count, folder_sets = self._sign_and_partition(
+                output_dir, self.image_paths, base_time, remove_sources=False)
+
             self.play_sound('apply.mp3')
-            self.root.after(0, lambda: messagebox.showinfo(
+            cache_note = self._cleanup_dsi_album_cache(output_dir) if self.console_type == "dsi" else ""
+            self.root.after(0, lambda note=cache_note: messagebox.showinfo(
                 "Export Complete", 
-                f"Successfully formatted, signed, and grouped {total_files} still images into selected directory layout!"
+                f"Successfully formatted, signed, and grouped {signed_count} still images into selected directory layout!"
+                + note
             ))
         except Exception as e:
             self.play_sound('warning.mp3')
@@ -2306,30 +2436,6 @@ class SIGMAFLIP:
 
         # --- OPTION B: Standard Video Frames Batch Export ---
         target_fps = SPEED_FPS[self.speed]
-        estimated_frames = math.ceil(self.total_video_frames * target_fps / self.video_fps)
-
-        # Notify the user about strict console directory limits before batching only if exceeding 100 frames
-        if estimated_frames > 100:
-            self.play_sound('warning.mp3')
-            
-            # Read selection variable dynamically to give custom matching advice based on menu modes [app.py]
-            use_parts = (self.export_structure == "parts")
-            if use_parts:
-                advice_msg = (
-                    f"This export will generate {estimated_frames} frames split into sequential 'Part_X' folders.\n\n"
-                    "Nintendo DSi/3DS filesystems limit camera galleries to 3,000 index entries and can lag when directories become cluttered.\n\n"
-                    "Because your clip exceeds 100 frames, we recommend loading only one folder (e.g. Part_1) to your SD card at a time, "
-                    "importing them into Flipnote, deleting them from the camera album, and then copying the next folder."
-                )
-            else:
-                advice_msg = (
-                    f"This export will generate {estimated_frames} frames inside a native 'DCIM' layout across multiple subdirectories.\n\n"
-                    "Nintendo DSi/3DS filesystems limit camera galleries to 3,000 index entries and can lag when directories become cluttered.\n\n"
-                    "To play these frames on your console, copy the generated 'DCIM' folder directly onto the root of your console's SD card! "
-                    "Because your clip exceeds 100 frames, we recommend loading only one subfolder (e.g. 100NIN01) to your SD card at a time, "
-                    "importing them into Flipnote, deleting them from the camera album, and then copying the next folder."
-                )
-            messagebox.showinfo("Nintendo SD Data Management Advice", advice_msg)
 
         target_dir = filedialog.askdirectory(title="Choose Output Export Directory")
         if not target_dir:
@@ -2356,56 +2462,61 @@ class SIGMAFLIP:
 
     def run_ffmpeg_export_pipeline(self, output_dir, ffmpeg_path):
         target_fps = SPEED_FPS[self.speed]
+        frame_step = max(1, round(self.video_fps / target_fps))
+        frame_limit = (self.total_video_frames - 1) // frame_step + 1
         bg_type = self.bg_type_var.get()
-        
-        # Upgraded filter pipelines to support custom backgrounds and solid custom hex margins
+
+        frame_sel = f"select='eq(mod(n,{frame_step}),0)'"
         if self.scale_mode == "Fit":
             if bg_type == "custom" and self.bg_image_path and os.path.exists(self.bg_image_path):
                 # Custom PNG/JPG file overlay complex layout map
                 filter_complex = (
-                    f"[1:v]scale=640:480[bg];"
-                    f"[0:v]fps={target_fps},scale=640:480:force_original_aspect_ratio=decrease[fg];"
+                    f"[0:v]{frame_sel},scale=640:480:force_original_aspect_ratio=decrease[fg];"
+                    f"[1:v]scale=640:480,fps={target_fps}[bg];"
                     f"[bg][fg]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2"
                 )
                 cmd = [
                     ffmpeg_path, "-y", 
                     "-i", self.video_path,
                     "-i", self.bg_image_path,
-                    "-fps_mode", "cfr",
+                    "-fps_mode", "vfr",
                     "-filter_complex", filter_complex,
+                    "-frames:v", str(frame_limit),
                     "-q:v", "2", os.path.join(output_dir, "HNI_%04d.JPG")
                 ]
             else:
                 color_str = "white" if bg_type == "white" else "black"
-                vf_filter = f"fps={target_fps},scale=640:480:force_original_aspect_ratio=decrease,pad=640:480:(ow-iw)/2:(oh-ih)/2:color={color_str}"
+                vf_filter = f"{frame_sel},scale=640:480:force_original_aspect_ratio=decrease,pad=640:480:(ow-iw)/2:(oh-ih)/2:color={color_str}"
                 cmd = [
                     ffmpeg_path, "-y", "-i", self.video_path,
-                    "-fps_mode", "cfr",
+                    "-fps_mode", "vfr",
                     "-vf", vf_filter, 
+                    "-frames:v", str(frame_limit),
                     "-q:v", "2", os.path.join(output_dir, "HNI_%04d.JPG")
                 ]
         else:
             # Stretch, Crop or Tiles (Tiles utilizes centered aspects with post-process drawing overrides in Python!)
             if self.scale_mode == "Stretch":
-                vf_filter = f"fps={target_fps},scale=640:480"
+                vf_filter = f"{frame_sel},scale=640:480"
             else: 
                 # Tiles and Tiles Stretched unpadded boundaries which our Python post-processor tiles beautifully!
                 if self.scale_mode in ("Tiles", "Tiles Stretched"):
-                    vf_filter = f"fps={target_fps},scale=640:480:force_original_aspect_ratio=decrease"
+                    vf_filter = f"{frame_sel},scale=640:480:force_original_aspect_ratio=decrease"
                 else: # Crop Mode
-                    vf_filter = f"fps={target_fps},scale=640:480:force_original_aspect_ratio=increase,crop=640:480"
+                    vf_filter = f"{frame_sel},scale=640:480:force_original_aspect_ratio=increase,crop=640:480"
                 
             cmd = [
                 ffmpeg_path, "-y", "-i", self.video_path,
-                "-fps_mode", "cfr",
+                "-fps_mode", "vfr",
                 "-vf", vf_filter, 
+                "-frames:v", str(frame_limit),
                 "-q:v", "2", os.path.join(output_dir, "HNI_%04d.JPG")
             ]
 
         try:
             self._exporting = True
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-            expected_frames = int(self.video_duration * target_fps)
+            expected_frames = frame_limit
             while True:
                 line = process.stderr.readline()
                 if not line:
@@ -2423,80 +2534,23 @@ class SIGMAFLIP:
             # Post-Processing: Sort files alphabetically, inject current timestamp, partition into folder sets of 100, and sign
             if process.returncode == 0:
                 self.root.after(0, lambda: self.file_name_label.configure(text="Timestamping, Signing & Splitting...", text_color=MAIN_COLOR))
-                
+
                 temp_filenames = sorted([
                     f for f in os.listdir(output_dir)
                     if f.lower().endswith((".jpg", ".jpeg"))
                 ])
-                
+
                 base_time = time.time()
-                signed_count = 0
-                frames_per_part = 100  # Match standard roll-over directory size
-                
-                # Fixed: Properly declared dcim_dir inside standard post-processing block [app.py]
-                dcim_dir = os.path.join(output_dir, "DCIM")
-                
-                # Check target folder modes cleanly inside the pipeline [app.py]
-                use_parts = (self.export_structure == "parts")
-                if not use_parts:
-                    os.makedirs(dcim_dir, exist_ok=True)
-                
-                # Chunk the list of filenames into subsets of 100
-                chunks = [temp_filenames[i:i + frames_per_part] for i in range(0, len(temp_filenames), frames_per_part)]
-                
-                for part_idx, chunk in enumerate(chunks):
-                    # Setup separate sets folders within DCIM directory natively (100NIN01, 101NIN01, etc.)
-                    if use_parts:
-                        part_name = f"Part_{part_idx + 1}"
-                        part_dir = os.path.join(output_dir, part_name)
-                    else:
-                        part_num = 100 + part_idx
-                        part_name = f"{part_num}NIN01"
-                        part_dir = os.path.join(dcim_dir, part_name)
-                    os.makedirs(part_dir, exist_ok=True)
-                    
-                    for file_idx, orig_filename in enumerate(chunk):
-                        orig_filepath = os.path.join(output_dir, orig_filename)
-                        
-                        # Apply folder sequence offsets cleanly [app.py]
-                        if use_parts:
-                            out_filename = f"HNI_{file_idx + 1:04d}.JPG"  # Resets to 0001 per subdirectory part
-                        else:
-                            global_idx = (part_idx * frames_per_part) + file_idx + 1
-                            out_filename = f"HNI_{global_idx:04d}.JPG"  # Continuous global sequence to prevent db conflicts
-                            
-                        new_filepath = os.path.join(part_dir, out_filename)
-                        
-                        try:
-                            # Process EXIF properties chronologically across parts
-                            frame_time = base_time + ((part_idx * frames_per_part) + file_idx) * 2
-                            time_str = time.strftime("%Y:%m:%d %H:%M:%S", time.localtime(frame_time))
-                            
-                            with Image.open(orig_filepath) as img:
-                                # Apply tiling dynamically to frame files before signing if selected
-                                img_processed = self.apply_scaling_to_image(img, 640, 480)
-                                
-                                # Strip any embedded color profiles or metadata to keep the header size identical
-                                img_processed.info.clear()
-                                
-                                self.encode_and_sign_frame_safe(img_processed, time_str, new_filepath)
-                            
-                            # Clean up un-parted parent root file
-                            if os.path.exists(orig_filepath):
-                                os.unlink(orig_filepath)
-                            
-                            os.utime(new_filepath, (frame_time, frame_time))
-                            signed_count += 1
-                        except Exception as e:
-                            print(f"Error processing {orig_filename} inside {part_name}: {e}")
-                        
-                        progress_val = signed_count / len(temp_filenames)
-                        self.root.after(0, lambda p=progress_val: self.progress_bar.set(p))
-                
+                sources = [os.path.join(output_dir, f) for f in temp_filenames]
+                signed_count, folder_sets = self._sign_and_partition(
+                    output_dir, sources, base_time, remove_sources=True)
+
                 self.play_sound('apply.mp3')
                 self.root.after(0, lambda: self.file_name_label.configure(text=os.path.basename(self.video_path), text_color=SUB_COLOR))
-                self.root.after(0, lambda c=signed_count, p=len(chunks): messagebox.showinfo(
+                cache_note = self._cleanup_dsi_album_cache(output_dir) if self.console_type == "dsi" else ""
+                self.root.after(0, lambda c=signed_count, p=folder_sets, note=cache_note: messagebox.showinfo(
                     "Export Complete", f"Successfully exported, timestamped, and signed {c} frames grouped into {p} folder sets!"
+                    + note
                 ))
             else:
                 self.play_sound('warning.mp3')
