@@ -1,12 +1,13 @@
 # sf/advanced.py
+import os
 import customtkinter as ctk
 import tkinter as tk
 
-def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, settings, on_change_callback, set_icon_fn):
+def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, settings, on_change_callback, set_icon_fn, get_export_structure=None, get_console_type=None):
     """Generates a styled, centered, modeless Advanced Settings window with transparent frames [sf/advanced.py]."""
     adv = ctk.CTkToplevel(parent)
-    adv.title("Advanced Filters")
-    adv.geometry("400x420")
+    adv.title("Advanced Settings")
+    adv.geometry("400x600")
     adv.resizable(False, False)
     adv.transient(parent)
     
@@ -47,14 +48,14 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
     frame = ctk.CTkFrame(adv, fg_color="transparent")
     frame.pack(fill=tk.BOTH, expand=True, padx=25, pady=20)
 
-    # Title
+    # Filters section title
     ctk.CTkLabel(
         frame, 
-        text="Advanced Filters", 
-        font=fonts['large'], 
+        text="Filters", 
+        font=fonts['medium_bold'], 
         text_color=main_color,
         fg_color="transparent"
-    ).pack(pady=(0, 15))
+    ).pack(anchor="center", pady=(0, 10))
 
     # 1. Pixel Precision Switch
     pixel_precision_var = tk.BooleanVar(value=settings.get("pixel_precision", False))
@@ -180,3 +181,157 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
     )
     contrast_slider.set(settings.get("contrast", 1.0))
     contrast_slider.pack(fill="x", pady=(5, 0))
+
+    # Export Options section title
+    ctk.CTkLabel(
+        frame, 
+        text="Export Options", 
+        font=fonts['medium_bold'], 
+        text_color=main_color,
+        fg_color="transparent"
+    ).pack(anchor="center", pady=(0, 10))
+
+    # 5. DCIM Folder Capacity Entry
+    capacity_frame = ctk.CTkFrame(frame, fg_color="transparent")
+    capacity_frame.pack(fill="x", pady=15)
+
+    capacity_label = ctk.CTkLabel(
+        capacity_frame,
+        text="Photos per DCIM folder:",
+        font=fonts['small'],
+        text_color=sub_color,
+        fg_color="transparent"
+    )
+    capacity_label.pack(anchor="center")
+
+    capacity_var = tk.StringVar(value=str(max(1, settings.get("album_capacity", 100))))
+    def on_capacity_change(*_):
+        try:
+            val = max(1, int(capacity_var.get()))
+        except ValueError:
+            val = 100
+        capacity_var.set(str(val))
+        settings["album_capacity"] = val
+        on_change_callback()
+
+    capacity_entry = ctk.CTkEntry(
+        capacity_frame,
+        textvariable=capacity_var,
+        width=120,
+        justify="center",
+        font=fonts['small'],
+        fg_color=("#ffffff", "#2b2b2b"),
+        text_color=main_color,
+        border_color=main_color
+    )
+    capacity_entry.pack(anchor="center", pady=(5, 0))
+    capacity_entry.bind("<FocusOut>", on_capacity_change)
+    capacity_entry.bind("<Return>", on_capacity_change)
+
+    # Disable the capacity batch setting while Sequential Parts is active.
+    if get_export_structure is not None:
+        def poll_structure():
+            if adv.winfo_exists():
+                if get_export_structure() == "parts":
+                    capacity_entry.configure(state="disabled")
+                    capacity_label.configure(text_color=("#9ca3af", "#6b7280"))
+                else:
+                    capacity_entry.configure(state="normal")
+                    capacity_label.configure(text_color=sub_color)
+                adv.after(500, poll_structure)
+        adv.after(500, poll_structure)
+
+    # Pit File section title
+    pit_title_label = ctk.CTkLabel(
+        frame, 
+        text="Pit File", 
+        font=fonts['medium_bold'], 
+        text_color=main_color,
+        fg_color="transparent"
+    )
+    pit_title_label.pack(anchor="center", pady=(0, 10))
+
+    pit_dir_var = tk.StringVar(value=settings.get("pit_dir", ""))
+    pit_status_var = tk.StringVar(value="")
+
+    pit_dir_label = ctk.CTkLabel(
+        frame,
+        textvariable=pit_dir_var,
+        font=fonts['tiny'],
+        text_color=sub_color,
+        fg_color="transparent",
+        wraplength=330
+    )
+    pit_dir_label.pack(anchor="center", pady=(0, 5))
+
+    def browse_pit_dir():
+        from tkinter import filedialog
+        chosen = filedialog.askdirectory(title="Select SD Card Root (or folder containing pit.bin)")
+        if chosen:
+            pit_dir_var.set(chosen)
+            settings["pit_dir"] = chosen
+            pit_status_var.set("")
+
+    browse_btn = ctk.CTkButton(
+        frame,
+        text="Browse Root...",
+        font=fonts['small'],
+        fg_color=("#2563eb", "#3b82f6"),
+        hover_color=highlight_color,
+        text_color="#ffffff",
+        command=browse_pit_dir
+    )
+    browse_btn.pack(anchor="center", pady=(0, 5))
+
+    def delete_pit():
+        from tkinter import messagebox
+        base = pit_dir_var.get().strip()
+        if not base:
+            pit_status_var.set("Choose a directory first.")
+            return
+        pit = os.path.join(base, "private", "ds", "app", "484E494A", "pit.bin")
+        if not os.path.isfile(pit):
+            pit_status_var.set(f"No pit.bin found at:\n{pit}")
+            return
+        if not messagebox.askyesno("Delete pit.bin", f"Delete stale album cache?\n\n{pit}"):
+            return
+        try:
+            os.unlink(pit)
+            pit_status_var.set("Deleted stale album cache.")
+        except Exception as e:
+            pit_status_var.set(f"Could not delete: {e}")
+
+    delete_btn = ctk.CTkButton(
+        frame,
+        text="Delete Pit File",
+        font=fonts['small'],
+        fg_color=("#dc2626", "#b91c1c"),
+        hover_color=highlight_color,
+        text_color="#ffffff",
+        command=delete_pit
+    )
+    delete_btn.pack(anchor="center", pady=(0, 5))
+
+    ctk.CTkLabel(
+        frame,
+        textvariable=pit_status_var,
+        font=fonts['tiny'],
+        text_color=sub_color,
+        fg_color="transparent",
+        wraplength=330
+    ).pack(anchor="center")
+
+    # Gray out (red highlight) the Pit File section while 3DS mode is active.
+    if get_console_type is not None:
+        def poll_console():
+            if adv.winfo_exists():
+                if get_console_type() == "3ds":
+                    pit_title_label.configure(text_color=("#dc2626", "#ef4444"))
+                    browse_btn.configure(state="disabled")
+                    delete_btn.configure(state="disabled")
+                else:
+                    pit_title_label.configure(text_color=main_color)
+                    browse_btn.configure(state="normal")
+                    delete_btn.configure(state="normal")
+                adv.after(500, poll_console)
+        adv.after(500, poll_console)
