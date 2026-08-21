@@ -1,5 +1,4 @@
 # dither.py
-import os
 from PIL import Image
 
 def apply_ordered_dither(gray_img, mode, u=-0.25, v=-0.60):
@@ -7,48 +6,37 @@ def apply_ordered_dither(gray_img, mode, u=-0.25, v=-0.60):
     gray_copy = gray_img.copy()
     
     if mode == "Flipnote Memory Saver (Experimental)":
-        # 1. Downscale the grayscale image to the DSi's native 256x192 resolution
         img_256 = gray_copy.resize((256, 192), Image.Resampling.LANCZOS)
         pixels = img_256.load()
         
-        # 2. Emulate the 2D Touch Grid Math
-        # Horizontal Axis (u) controls brightness: Left (< 0) boosts brightness/exposure
         brightness_offset = -int(u * 55)
         
         # Vertical Axis (v) controls the dither transition band width
         # At v = -1.0 (bottom), width is 0 (pure high-contrast thresholding)
         # At v = 1.0 (top), width is wide (broad dithered gradients)
         dither_width = int(90 * (v + 1.0))
-        dither_width = max(0, min(120, dither_width))  # Keep within safe bounds
+        dither_width = max(0, min(120, dither_width))
         
         center_threshold = 128
         lower_bound = center_threshold - dither_width
         upper_bound = center_threshold + dither_width
-        
-        # Sub-divide the active dither band into three progressive density zones
         step = dither_width / 3.0 if dither_width > 0 else 1.0
         
-        # 3. Apply the scanlines and threshold math
         for y in range(192):
             if y % 2 == 1:
                 # Erase alternate scanlines to match classic Flipnote line brush gaps
                 for x in range(256):
                     pixels[x, y] = 255
             else:
-                # Apply custom density dither on the active scanlines
                 for x in range(256):
-                    # Apply the exposure shift
                     val = pixels[x, y] + brightness_offset
                     val = max(0, min(255, val))
                     
                     if val < lower_bound:
-                        # Below dither range: Solid Black
                         pixels[x, y] = 0
                     elif val > upper_bound:
-                        # Above dither range: Solid White
                         pixels[x, y] = 255
                     else:
-                        # Inside the narrow dither band: Apply density steps
                         if val < lower_bound + step:
                             # Dark dither (sparse white pixels)
                             pixels[x, y] = 0 if x % 4 != 0 else 255
@@ -59,8 +47,6 @@ def apply_ordered_dither(gray_img, mode, u=-0.25, v=-0.60):
                             # Light dither (sparse black pixels)
                             pixels[x, y] = 0 if x % 4 == 0 else 255
         
-        # 4. Upscale back to the target size
-        # Bilinear interpolation allows the DSi/3DS hardware downscaler to reconstruct the 1px grid cleanly
         target_w, target_h = gray_copy.size
         img_upscaled = img_256.resize((target_w, target_h), Image.Resampling.BILINEAR)
         return img_upscaled
@@ -220,16 +206,14 @@ def apply_error_diffusion(gray_img, kernel_name, exporting, rapid_rendering):
                             row_y1[x + 1] += err5
                         if x + 2 < width:
                             row_y1[x + 2] += err3
-                    if row_y2:
-                        if x - 2 >= 0:
-                            row_y2[x - 2] += err1
-                        if x - 1 >= 0:
-                            row_y2[x - 1] += err3
-                        row_y2[x] += err5
-                        if x + 1 < width:
-                            row_y2[x + 1] += err3
-                        if x + 2 < width:
-                            row_y2[x + 2] += err1
+                if row_y2:
+                    if x - 2 >= 0:
+                        row_y2[x - 2] += err1
+                    row_y2[x] += err4
+                    if x + 1 < width:
+                        row_y2[x + 1] += err2
+                    if x + 2 < width:
+                        row_y2[x + 2] += err1
 
     elif kernel_name == "Stucki":
         for y in range(height):
@@ -265,7 +249,7 @@ def apply_error_diffusion(gray_img, kernel_name, exporting, rapid_rendering):
                     if x - 2 >= 0:
                         row_y2[x - 2] += err1
                     if x - 1 >= 0:
-                        row_y2[x - 2] += err2
+                        row_y2[x - 1] += err2
                     row_y2[x] += err4
                     if x + 1 < width:
                         row_y2[x + 1] += err2
@@ -332,7 +316,7 @@ def apply_error_diffusion(gray_img, kernel_name, exporting, rapid_rendering):
                     if x - 2 >= 0:
                         row_y1[x - 2] += err1
                     if x - 1 >= 0:
-                        row_y1[x - 2] += err2
+                        row_y1[x - 1] += err2
                     row_y1[x] += err3
                     if x + 1 < width:
                         row_y1[x + 1] += err2
