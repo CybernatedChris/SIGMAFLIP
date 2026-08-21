@@ -2,6 +2,7 @@
 import os
 import sys
 import platform
+import subprocess
 import tkinter.font as tkfont
 import shutil
 
@@ -20,7 +21,7 @@ os.environ.setdefault('SDL_VIDEODRIVER', 'dummy')
 os.environ.setdefault('PYGAME_HIDE_SUPPORT_PROMPT', '1')
 
 # Sleek Stealth Slate Color Palette
-MAIN_COLOR = "#E2E8F0"  # Bright Titanium Platinum
+MAIN_COLOR = "#E2E8F0"  # Bright Titanium Platinum (dark mode)
 SUB_COLOR = "#64748B"   # Tactical Cool Slate Gray
 MAX_FRAMES = 999
 SPEED_FPS = {1: 0.5, 2: 1, 3: 2, 4: 4, 5: 6, 6: 12, 7: 20, 8: 30}
@@ -107,8 +108,8 @@ def load_custom_font(root, font_path):
             os.makedirs(d, exist_ok=True)
             dest = os.path.join(d, os.path.basename(font_path))
             if not os.path.exists(dest):
-                shutil.copy2(font_path, dest)
-                os.system("fc-cache -f 2>/dev/null")
+                    shutil.copy2(font_path, dest)
+                    subprocess.run(["fc-cache", "-f"], capture_output=True)
         except Exception:
             return fallback
 
@@ -122,3 +123,21 @@ def load_custom_font(root, font_path):
     word = family.split()[0].lower()
     matches = [f for f in available if word in f.lower()]
     return matches[0] if matches else fallback
+
+
+def draw_grid_on_canvas(canvas, width, height, mode):
+    """Draw a 10px grid pattern on a tk.Canvas. mode is 'dark' or 'light'."""
+    if mode == "dark":
+        bg_color = "#151515"
+        line_color = "#222522"
+    else:
+        bg_color = "#f3f4f6"
+        line_color = "#e5e7eb"
+    canvas.configure(bg=bg_color)
+    canvas.delete("all")
+    grid_spacing = 10
+    for x in range(0, width, grid_spacing):
+        canvas.create_line(x, 0, x, height, fill=line_color, width=1)
+    for y in range(0, height, grid_spacing):
+        canvas.create_line(0, y, width, y, fill=line_color, width=1)
+    canvas.tk.call('lower', canvas._w)
