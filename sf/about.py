@@ -3,9 +3,10 @@ import os
 import customtkinter as ctk
 import tkinter as tk
 from PIL import Image
+from sf.config import draw_grid_on_canvas
 
 def show_about_dialog(parent, fonts, icon_path, main_color, sub_color, highlight_color, set_icon_fn):
-    """Generates a styled, centered About window with transparent grid backgrounds [sf/about.py]."""
+    """Generates a styled, centered About window with transparent grid backgrounds."""
     about = ctk.CTkToplevel(parent)
     about.title("About SIGMAFLIP")
     about.geometry("440x580")
@@ -13,34 +14,16 @@ def show_about_dialog(parent, fonts, icon_path, main_color, sub_color, highlight
     about.transient(parent)
     about.grab_set()
     
-    # Configure native window background to match the active grid canvas
     theme_bg = ("#f3f4f6", "#151515")
     about.configure(fg_color=theme_bg)
     
     set_icon_fn(about, delay=True)
 
-    # Grid Background Canvas
     bg_canvas = tk.Canvas(about, bg="#1a1a1a", highlightthickness=0, bd=0)
     bg_canvas.place(x=0, y=0, relwidth=1, relheight=1)
 
-    def draw_grid(event=None):
-        ww = about.winfo_width()
-        wh = about.winfo_height()
-        bg_canvas.delete("all")
-        curr_mode = ctk.get_appearance_mode().lower()
-        bg_color = "#151515" if curr_mode == "dark" else "#f3f4f6"
-        line_color = "#222522" if curr_mode == "dark" else "#e5e7eb"
-        bg_canvas.configure(bg=bg_color)
-        grid_spacing = 10
-        for x in range(0, ww, grid_spacing):
-            bg_canvas.create_line(x, 0, x, wh, fill=line_color, width=1)
-        for y in range(0, wh, grid_spacing):
-            bg_canvas.create_line(0, y, ww, y, fill=line_color, width=1)
-        bg_canvas.tk.call('lower', bg_canvas._w)
+    about.bind("<Configure>", lambda e: draw_grid_on_canvas(bg_canvas, about.winfo_width(), about.winfo_height(), ctk.get_appearance_mode().lower()))
 
-    about.bind("<Configure>", draw_grid)
-
-    # Main Styling Container (transparent so grid bg shows through)
     frame = ctk.CTkFrame(about, fg_color="transparent")
     frame.pack(fill=tk.BOTH, expand=True, padx=25, pady=20)
 
@@ -54,7 +37,6 @@ def show_about_dialog(parent, fonts, icon_path, main_color, sub_color, highlight
         except Exception as e:
             print(f"About image rendering error: {e}")
 
-    # SIGMAFLIP Title
     ctk.CTkLabel(
         frame, 
         text="SIGMAFLIP", 
@@ -63,7 +45,6 @@ def show_about_dialog(parent, fonts, icon_path, main_color, sub_color, highlight
         fg_color="transparent"
     ).pack(pady=(0, 5))
 
-    # Description Text Box
     body_text = (
         "A FOSS Python-based alternative to SignaPic DSi, "
         "used for converting videos into JPEG-based frames according to Flipnote speed.\n\n"
@@ -115,7 +96,6 @@ def show_about_dialog(parent, fonts, icon_path, main_color, sub_color, highlight
         fg_color="transparent"
     ).pack(padx=10, pady=8)
 
-    # Bottom Footer Version
     ctk.CTkLabel(
         frame, 
         text="v1", 
