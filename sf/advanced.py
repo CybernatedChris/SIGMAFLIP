@@ -2,53 +2,35 @@
 import os
 import customtkinter as ctk
 import tkinter as tk
+from sf.config import draw_grid_on_canvas
 
-def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, settings, on_change_callback, set_icon_fn, get_export_structure=None, get_console_type=None):
-    """Generates a styled, centered, modeless Advanced Settings window with transparent frames [sf/advanced.py]."""
+def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, settings, on_change_callback, set_icon_fn, get_export_structure=None, get_console_type=None, theme_bg=None):
+    """Generates a styled, centered, modeless Advanced Settings window with transparent frames."""
     adv = ctk.CTkToplevel(parent)
     adv.title("Advanced Settings")
     adv.geometry("400x600")
     adv.resizable(False, False)
     adv.transient(parent)
+    adv.grab_set()
     
-    # Configure native window background to match the active grid canvas
     theme_bg = ("#f3f4f6", "#151515")
     adv.configure(fg_color=theme_bg)
     
-    set_icon_fn(adv, delay=True) # Bind icon files natively
+    set_icon_fn(adv, delay=True)
 
-    # Grid Background Canvas
     bg_canvas = tk.Canvas(adv, bg="#1a1a1a", highlightthickness=0, bd=0)
     bg_canvas.place(x=0, y=0, relwidth=1, relheight=1)
 
-    def draw_grid(event=None):
-        ww = adv.winfo_width()
-        wh = adv.winfo_height()
-        bg_canvas.delete("all")
-        curr_mode = ctk.get_appearance_mode().lower()
-        bg_color = "#151515" if curr_mode == "dark" else "#f3f4f6"
-        line_color = "#222522" if curr_mode == "dark" else "#e5e7eb"
-        bg_canvas.configure(bg=bg_color)
-        grid_spacing = 10
-        for x in range(0, ww, grid_spacing):
-            bg_canvas.create_line(x, 0, x, wh, fill=line_color, width=1)
-        for y in range(0, wh, grid_spacing):
-            bg_canvas.create_line(0, y, ww, y, fill=line_color, width=1)
-        bg_canvas.tk.call('lower', bg_canvas._w)
+    adv.bind("<Configure>", lambda e: draw_grid_on_canvas(bg_canvas, adv.winfo_width(), adv.winfo_height(), ctk.get_appearance_mode().lower()))
 
-    adv.bind("<Configure>", draw_grid)
-
-    # Centering Calculations
     adv.update_idletasks()
     x = parent.winfo_rootx() + (parent.winfo_width() - adv.winfo_width()) // 2
     y = parent.winfo_rooty() + (parent.winfo_height() - adv.winfo_height()) // 2
     adv.geometry(f"+{x}+{y}")
 
-    # Main Container (transparent so grid bg shows through)
     frame = ctk.CTkFrame(adv, fg_color="transparent")
     frame.pack(fill=tk.BOTH, expand=True, padx=25, pady=20)
 
-    # Filters section title
     ctk.CTkLabel(
         frame, 
         text="Filters", 
@@ -57,7 +39,6 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         fg_color="transparent"
     ).pack(anchor="center", pady=(0, 10))
 
-    # 1. Pixel Precision Switch
     pixel_precision_var = tk.BooleanVar(value=settings.get("pixel_precision", False))
     def toggle_pixel_precision():
         settings["pixel_precision"] = pixel_precision_var.get()
@@ -74,7 +55,6 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
     )
     pixel_switch.pack(anchor="w", pady=8)
 
-    # 2. Black and White Switch
     bw_var = tk.BooleanVar(value=settings.get("black_and_white", False))
     def toggle_bw():
         val = bw_var.get()
@@ -96,7 +76,6 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
     )
     bw_switch.pack(anchor="w", pady=8)
 
-    # 3. Dithering Mode Dropdown Container
     dither_frame = ctk.CTkFrame(frame, fg_color="transparent")
     dither_frame.pack(fill="x", pady=8)
 
@@ -135,12 +114,12 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         dither_frame,
         values=dither_modes,
         command=change_dither,
-        fg_color=main_color,
-        button_color=main_color,
+        fg_color=theme_bg or ("#ffffff", "#2b2b2b"),
+        button_color=theme_bg or ("#ffffff", "#2b2b2b"),
         button_hover_color=highlight_color,
         dropdown_fg_color=("#ffffff", "#2b2b2b"),
-        dropdown_text_color=("#111827", "#E2E8F0"),
-        text_color=("#ffffff", "#111827"),
+        dropdown_text_color=("#1e293b", "#E2E8F0"),
+        text_color=("#1e293b", "#E2E8F0"),
         font=fonts['tiny'],
         dropdown_font=fonts['tiny']
     )
@@ -150,7 +129,6 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
     if not bw_var.get():
         dither_menu.configure(state="disabled")
 
-    # 4. Contrast Slider Container
     contrast_frame = ctk.CTkFrame(frame, fg_color="transparent")
     contrast_frame.pack(fill="x", pady=15)
 
@@ -182,7 +160,6 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
     contrast_slider.set(settings.get("contrast", 1.0))
     contrast_slider.pack(fill="x", pady=(5, 0))
 
-    # Export Options section title
     ctk.CTkLabel(
         frame, 
         text="Export Options", 
@@ -191,7 +168,6 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         fg_color="transparent"
     ).pack(anchor="center", pady=(0, 10))
 
-    # 5. DCIM Folder Capacity Entry
     capacity_frame = ctk.CTkFrame(frame, fg_color="transparent")
     capacity_frame.pack(fill="x", pady=15)
 
@@ -228,7 +204,6 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
     capacity_entry.bind("<FocusOut>", on_capacity_change)
     capacity_entry.bind("<Return>", on_capacity_change)
 
-    # Disable the capacity batch setting while Sequential Parts is active.
     if get_export_structure is not None:
         def poll_structure():
             if adv.winfo_exists():
@@ -241,7 +216,6 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
                 adv.after(500, poll_structure)
         adv.after(500, poll_structure)
 
-    # Pit File section title
     pit_title_label = ctk.CTkLabel(
         frame, 
         text="Pit File", 
@@ -321,7 +295,6 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         wraplength=330
     ).pack(anchor="center")
 
-    # Gray out (red highlight) the Pit File section while 3DS mode is active.
     if get_console_type is not None:
         def poll_console():
             if adv.winfo_exists():
