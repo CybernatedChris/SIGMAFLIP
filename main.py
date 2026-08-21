@@ -1,8 +1,6 @@
-# main.py
 import platform
 import customtkinter as ctk
 
-# Configure DPI awareness before ctk.CTk() is initialized to guarantee pixel-perfect native monitor scaling
 if platform.system() == "Windows":
     try:
         import ctypes
