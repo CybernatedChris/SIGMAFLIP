@@ -1508,6 +1508,14 @@ class SIGMAFLIP:
                     self.video_fps = self.total_video_frames / (total_ms / 1000.0)
             except Exception:
                 pass
+        # Container metadata often overcounts by 1+ (undecodable last frame); trust
+        # only what actually decodes, or the export estimate overshoots by that amount.
+        while self.total_video_frames > 1:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.total_video_frames - 1)
+            ret, _ = self.cap.read()
+            if ret:
+                break
+            self.total_video_frames -= 1
         self.video_duration = self.total_video_frames / self.video_fps
 
         self.play_btn.configure(state="normal")
@@ -1893,13 +1901,18 @@ class SIGMAFLIP:
         self.current_frame_idx = frame_idx
         self.timeline_slider.set(int(self.current_frame_idx))
         self.update_frame_display()
-        if self._music_paused:
-            # Seek invalidates the paused audio position; resume must restart from here
+        if self._music_paused or self.playing:
+            # Seek invalidates the audio position; restart it at the snapped frame
             try:
                 pygame.mixer.music.stop()
             except Exception:
                 pass
             self._music_paused = False
+        if self.playing:
+            # Re-anchor the playback clock so the tick loop continues from here
+            self._playback_start_time = time.time()
+            self._playback_start_frame = self.current_frame_idx
+            self.start_audio_at_current_frame()
 
     def toggle_play(self):
         if not self.cap or (self.export_mode_var.get() == "Singular Image"):
