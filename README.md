@@ -23,6 +23,20 @@ By pure accident. The story is, I thought that I can use this tool to only split
 ## How to use this?
 Choose the dropdown mode between Video Frames or Singular Image. For Video Frames, choose any video supported by SIGMAFLIP.
 
+### Importing images onto a 3DS 
+The DCIM structure for the 3DS is very much the same as the DSi. Unlike the DSi, **you don't need to delete a pit.bin file. Use the 3DS Camera instead.**
+
+## SignaPic DSi and SIGMAFLIP Differences:
+|       | SignaPic DSi | SIGMAFLIP |
+|-------|--------|---------|
+| Platform | Windows Only* | Cross Platform |
+| Video support? | ❌ | ✔ |
+| File Format | JPEG only   | PNG, JPEG/JPG, WEBP, BMP (Singular Image) MP4 AVI MOV MKV GIF (Video Frames)|
+| Last Activity | around 2019 to 2022 | 2026 and beyond (until I say so) |
+| Other known features | Resizing, widecut, and proportionate images, DPI optimization | More resizing options such as title layout, additional filters, black/white/custom backgrounds, DCIM tree or Part_X tree exporting layouts, 3DS support, pit.bin deletion/detection confirmation|
+
+*Works natively under Wine
+
 ## What you need (for manually executing):
 - Python 3.14+ recommended
 - FFmpeg
@@ -60,18 +74,21 @@ python main.py
 <img width="502" height="632" alt="imageselector" src="https://github.com/user-attachments/assets/083ce05a-21e2-462d-8f20-fbd0fa9c3be9" />
 <img width="502" height="632" alt="imgselectorbulkpreview" src="https://github.com/user-attachments/assets/6b4f1c35-c63e-4b69-9e38-5d33df13be1d" />
 
-
 As of v1
 
-## Special Thanks
-- cimo95: inspiration of making SIGMAFLIP [(see SignaPic DSi here)](https://gbatemp.net/threads/signapic-dsi-simple-step-to-import-any-jpg-images-into-nintendo-dsi.552288/)
-- MrNbaYoh: the source of how to sign pictures into the DSi https://github.com/MrNbaYoh/dsi_jpeg_signature_tool
+## Limitations:
+The Flipnote Memory Saver filter is experimental. When you use the filter in Flipnote Studio, you must move the cursor at this spot: <br />
+<img width="562" height="844" alt="memsavelocator" src="https://github.com/user-attachments/assets/677546e2-63b8-4a66-8a07-afdfe8e98dd8" /> <br />
+Your image may appear darker/lighter than expected, use the contrast settings.
 
+## Special Thanks
+- cimo95: inspiration of the SIGMAFLIP [(see SignaPic DSi here)](https://gbatemp.net/threads/signapic-dsi-simple-step-to-import-any-jpg-images-into-nintendo-dsi.552288/)
+- MrNbaYoh: the source of how to sign pictures into the DSi https://github.com/MrNbaYoh/dsi_jpeg_signature_tool
 
 ####
 
 ## License
-Due to the nature of this project of it being vibe coded (except for the art) and some sprinkled in shitpost humor, this project is licensed under the WTFPL license, thus the reason why I closed this project from future issues or pull requests. Fork the project, vibe code even more on it, or just do whatever the fuck you want!
+Due to the nature of this code being slopped together (except for the art) and some sprinkled in shitpost humor, this project is licensed under the WTFPL license, thus the reason why I closed this project from future issues or pull requests. Here's what you can do: fork the project, vibe code even more on it, or just do whatever the fuck you want!
 
 <a href="http://www.wtfpl.net/"><img
        src="http://www.wtfpl.net/wp-content/uploads/2012/12/wtfpl-badge-4.png"
