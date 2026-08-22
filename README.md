@@ -29,13 +29,14 @@ The DCIM structure for the 3DS is very much the same as the DSi. Unlike the DSi,
 ## SignaPic DSi and SIGMAFLIP Differences:
 |       | SignaPic DSi | SIGMAFLIP |
 |-------|--------|---------|
-| Platform | Windows Only* | Cross Platform |
+| Platform | Windows Only* | Cross Platform** |
 | Video support? | ❌ | ✔ |
 | File Format | JPEG only   | PNG, JPEG/JPG, WEBP, BMP (Singular Image) MP4 AVI MOV MKV GIF (Video Frames)|
 | Last Activity | around 2019 to 2022 | 2026 and beyond (until I say so) |
 | Other known features | Resizing, widecut, and proportionate images, DPI optimization | More resizing options such as title layout, additional filters, black/white/custom backgrounds, DCIM tree or Part_X tree exporting layouts, 3DS support, pit.bin deletion/detection confirmation|
 
 *Works natively under Wine
+**I don't use Mac, however because it's built on Python, it *could* possibly work.
 
 ## What you need (for manually executing):
 - Python 3.14+ recommended
@@ -55,7 +56,7 @@ and then <br>
 
 
 Mac/Linux steps (or Windows optionally): <br>
-It's best to make a virtual environment, open a terminal to where your venv should be saved:
+Like I mentioned above, I don't use Mac, so it's best to make a virtual environment. Open a terminal to where your venv should be saved:
 ```
 python -m venv sfvenv
 
