@@ -25,7 +25,7 @@ By pure accident. The story is, I thought that I can use this tool to only split
 The purpose is to obviously convert frames or pictures into a readable DSi format... To give some idea, perhaps record something on your phone and convert it with SIGMAFLIP, or make a stop motion animation with your camera and take all the frames then convert them back into Flipnote Studio (you have the DSi/3DS that does this), or convert a funny meme and port the frames into SIGMAFLIP, then port every frame back to Flipnote Studio. That's all I can suggest! For the bans, no. The only ban you could get is ***flipnote signing***. Both SIGMAFLIP and SignaPic are DSi JPEG signers, not flipnote encoders.
 
 ## How to use this?
-Choose the dropdown mode between Video Frames or Singular Image. For Video Frames, choose any video supported by SIGMAFLIP.
+Choose the dropdown mode between Video Frames or Singular Image, then click the <img width=30 src=https://github.com/CybernatedChris/SIGMAFLIP/blob/main/sf/assets/img/upload.png> button. For Video Frames, choose any video supported by SIGMAFLIP, GIFS are considered a video format. For Singular Image, exporting one image can only output HNI_0001.JPG, not the entire folder structure.
 
 ### Importing images onto a 3DS 
 The DCIM structure for the 3DS is very much the same as the DSi, just different naming. Unlike the DSi, **you don't need to delete a pit.bin file. Use the 3DS Camera instead.**
