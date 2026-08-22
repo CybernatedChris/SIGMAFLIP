@@ -68,4 +68,14 @@ As of v1
 - MrNbaYoh: the source of how to sign pictures into the DSi https://github.com/MrNbaYoh/dsi_jpeg_signature_tool
 
 
+####
+
+## License
+Due to the nature of this project of it being vibe coded (except for the art) and some sprinkled in shitpost humor, this project is licensed under the WTFPL license, thus the reason why I closed this project from future issues or pull requests. Fork the project, vibe code even more on it, or just do whatever the fuck you want!
+
+<a href="http://www.wtfpl.net/"><img
+       src="http://www.wtfpl.net/wp-content/uploads/2012/12/wtfpl-badge-4.png"
+       width="80" height="15" alt="WTFPL" /></a>
+
+       
 **(SIGMAFLIP is not in relation with cimo95, MrNbaYoh, Nintendo, and Flipnote Studio. All sounds and Flipnote Studio belong to Nintendo.)**
