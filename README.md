@@ -40,7 +40,7 @@ The DCIM structure for the 3DS is very much the same as the DSi, just different 
 | Other known features | Resizing, widecut, and proportionate images, DPI optimization | More resizing options such as title layout, additional filters, black/white/custom backgrounds, DCIM tree or Part_X tree exporting layouts, 3DS support, pit.bin deletion/detection confirmation|
 
 *Works natively under Wine <br />
-**I don't use Mac, however because it's built on Python, it *could* possibly work
+**Windows/Mac/Linux desktop only (I don't use Mac)
 
 ## What you need (for manually executing):
 - Python 3.14+ recommended
