@@ -11,7 +11,6 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
     adv.geometry("400x600")
     adv.resizable(False, False)
     adv.transient(parent)
-    adv.grab_set()
     
     theme_bg = ("#f3f4f6", "#151515")
     adv.configure(fg_color=theme_bg)
