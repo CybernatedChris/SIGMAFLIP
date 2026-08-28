@@ -4,3 +4,4 @@ customtkinter
 fonttools
 opencv-python
 pycryptodome
+numba
