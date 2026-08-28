@@ -1,6 +1,4 @@
-# sf/config.py
 import os
-import sys
 import platform
 import subprocess
 import tkinter.font as tkfont
@@ -25,21 +23,8 @@ MAIN_COLOR = "#E2E8F0"  # Bright Titanium Platinum (dark mode)
 SUB_COLOR = "#64748B"   # Tactical Cool Slate Gray
 MAX_FRAMES = 999
 SPEED_FPS = {1: 0.5, 2: 1, 3: 2, 4: 4, 5: 6, 6: 12, 7: 20, 8: 30}
-VERSION = "v1"
+VERSION = "v1.1"
 WARNING_DURATION = 60.0
-
-def get_resource_path(relative_path):
-    # Resolves directly to the package environment level
-    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, relative_path)
-
-def get_icon_path(img_dir, name):
-    order = [f"{name}.ico", f"{name}.png"] if IS_WINDOWS else [f"{name}.png", f"{name}.ico"]
-    for f in order:
-        p = os.path.join(img_dir, f)
-        if os.path.exists(p):
-            return p
-    return None
 
 def safe_relpath(target, start):
     try:
