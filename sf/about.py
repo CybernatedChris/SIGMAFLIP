@@ -1,9 +1,8 @@
-# sf/about.py
 import os
 import customtkinter as ctk
 import tkinter as tk
 from PIL import Image
-from sf.config import draw_grid_on_canvas
+from sf.config import draw_grid_on_canvas, VERSION
 
 def show_about_dialog(parent, fonts, icon_path, main_color, sub_color, highlight_color, set_icon_fn):
     """Generates a styled, centered About window with transparent grid backgrounds."""
@@ -98,7 +97,7 @@ def show_about_dialog(parent, fonts, icon_path, main_color, sub_color, highlight
 
     ctk.CTkLabel(
         frame, 
-        text="v1", 
+        text=VERSION,
         font=fonts['tiny'], 
         text_color=sub_color,
         fg_color="transparent"
