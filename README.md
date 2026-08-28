@@ -91,8 +91,11 @@ https://github.com/user-attachments/assets/b0c372c4-e0da-4705-a62d-e6118309216f
 ### Flipnote Memory Saver filter
 
 The Flipnote Memory Saver filter is experimental. When you use the filter in Flipnote Studio, you must move the cursor at this spot: <br />
-<img width="562" height="844" alt="memsavelocator" src="https://github.com/user-attachments/assets/677546e2-63b8-4a66-8a07-afdfe8e98dd8" /> <br />
+<img width="350" height="526" alt="memsavelocator" src="https://github.com/user-attachments/assets/677546e2-63b8-4a66-8a07-afdfe8e98dd8" /> <br />
 Your image may appear darker/lighter than expected, use the contrast settings.
+
+### Video/GIF Frame Exporting
+Sometimes, videos/GIFs could have a low frame count. When you increase your speed, your videos/GIFs may have the same frame count resulting your flipnote to be faster than what you see.
 
 ### Custom button UI
 Some buttons don't briefly change when they are clicked. Some buttons don't even fully press down. It's a bit of an annoyance however this will be fixed later on.
