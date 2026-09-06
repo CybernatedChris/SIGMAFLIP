@@ -1787,15 +1787,27 @@ class SIGMAFLIP:
         except Exception:
             self.has_audio = False
 
+    def get_effective_duration(self):
+        duration = self.video_duration
+        if self.temp_audio_path and os.path.exists(self.temp_audio_path):
+            try:
+                import wave
+                with wave.open(self.temp_audio_path, 'rb') as wf:
+                    audio_dur = wf.getnframes() / float(wf.getframerate())
+                    duration = max(duration, audio_dur)
+            except Exception:
+                pass
+        return duration
+
+
     def check_timing_warnings(self, show_popup=False):
-        """Processes video frame warnings preventing continuous dialog prompts during slider changes."""
         if self.export_mode_var.get() == "Singular Image":
             self.update_indicator_metrics(0)
             return
 
         target_fps = SPEED_FPS[self.speed]
-        frame_step = max(1, round(self.video_fps / target_fps))
-        estimated_frames = (self.total_video_frames - 1) // frame_step + 1
+        effective_dur = self.get_effective_duration()
+        estimated_frames = max(1, math.ceil(effective_dur * target_fps))
 
         # Trigger message box dialog block only when requested
         if show_popup and self.video_duration > WARNING_DURATION:
@@ -2594,52 +2606,47 @@ class SIGMAFLIP:
 
     def run_ffmpeg_export_pipeline(self, output_dir: str, ffmpeg_path: str, bg_type: str = "black") -> None:
         target_fps = SPEED_FPS[self.speed]
-        frame_step = max(1, round(self.video_fps / target_fps))
-        frame_limit = (self.total_video_frames - 1) // frame_step + 1
+        effective_dur = self.get_effective_duration()
+        frame_limit = max(1, math.ceil(effective_dur * target_fps))
 
-        frame_sel = f"select='eq(mod(n,{frame_step}),0)'"
+        # tpad clones the final frame so EOF doesn't prematurely kill the last frame
+        fps_filter = f"tpad=stop_mode=clone:stop_duration=2,fps={target_fps}:round=up"
+
         if self.scale_mode == "Fit":
             if bg_type == "custom" and self.bg_image_path and os.path.exists(self.bg_image_path):
-                # Custom PNG/JPG file overlay complex layout map
                 filter_complex = (
-                    f"[0:v]{frame_sel},scale=640:480:force_original_aspect_ratio=decrease[fg];"
+                    f"[0:v]{fps_filter},scale=640:480:force_original_aspect_ratio=decrease[fg];"
                     f"[1:v]scale=640:480,fps={target_fps}[bg];"
                     f"[bg][fg]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2"
                 )
                 cmd = [
-                    ffmpeg_path, "-y", 
+                    ffmpeg_path, "-y",
                     "-i", self.video_path,
                     "-i", self.bg_image_path,
-                    "-fps_mode", "vfr",
                     "-filter_complex", filter_complex,
                     "-frames:v", str(frame_limit),
                     "-q:v", "2", os.path.join(output_dir, "HNI_%04d.JPG")
                 ]
             else:
                 color_str = "white" if bg_type == "white" else "black"
-                vf_filter = f"{frame_sel},scale=640:480:force_original_aspect_ratio=decrease,pad=640:480:(ow-iw)/2:(oh-ih)/2:color={color_str}"
+                vf_filter = f"{fps_filter},scale=640:480:force_original_aspect_ratio=decrease,pad=640:480:(ow-iw)/2:(oh-ih)/2:color={color_str}"
                 cmd = [
                     ffmpeg_path, "-y", "-i", self.video_path,
-                    "-fps_mode", "vfr",
-                    "-vf", vf_filter, 
+                    "-vf", vf_filter,
                     "-frames:v", str(frame_limit),
                     "-q:v", "2", os.path.join(output_dir, "HNI_%04d.JPG")
                 ]
         else:
-            # Stretch, Crop or Tiles (Tiles utilizes centered aspects with post-process drawing overrides in Python!)
             if self.scale_mode == "Stretch":
-                vf_filter = f"{frame_sel},scale=640:480"
-            else: 
-                # Tiles and Tiles Stretched unpadded boundaries which our Python post-processor tiles beautifully!
-                if self.scale_mode in ("Tiles", "Tiles Stretched"):
-                    vf_filter = f"{frame_sel},scale=640:480:force_original_aspect_ratio=decrease"
-                else: # Crop Mode
-                    vf_filter = f"{frame_sel},scale=640:480:force_original_aspect_ratio=increase,crop=640:480"
-                
+                vf_filter = f"{fps_filter},scale=640:480"
+            elif self.scale_mode in ("Tiles", "Tiles Stretched"):
+                vf_filter = f"{fps_filter},scale=640:480:force_original_aspect_ratio=decrease"
+            else:  # Crop
+                vf_filter = f"{fps_filter},scale=640:480:force_original_aspect_ratio=increase,crop=640:480"
+
             cmd = [
                 ffmpeg_path, "-y", "-i", self.video_path,
-                "-fps_mode", "vfr",
-                "-vf", vf_filter, 
+                "-vf", vf_filter,
                 "-frames:v", str(frame_limit),
                 "-q:v", "2", os.path.join(output_dir, "HNI_%04d.JPG")
             ]
