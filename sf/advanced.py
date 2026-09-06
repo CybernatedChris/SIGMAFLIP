@@ -1,3 +1,4 @@
+# sf/advanced.py
 import os
 import customtkinter as ctk
 import tkinter as tk
@@ -19,7 +20,15 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
     bg_canvas = tk.Canvas(adv, bg="#1a1a1a", highlightthickness=0, bd=0)
     bg_canvas.place(x=0, y=0, relwidth=1, relheight=1)
 
-    adv.bind("<Configure>", lambda e: draw_grid_on_canvas(bg_canvas, adv.winfo_width(), adv.winfo_height(), ctk.get_appearance_mode().lower()))
+    last_grid = {"w": 0, "h": 0}
+    def draw_bg(event=None):
+        w = adv.winfo_width()
+        h = adv.winfo_height()
+        if w == last_grid["w"] and h == last_grid["h"]:
+            return
+        last_grid.update(w=w, h=h)
+        draw_grid_on_canvas(bg_canvas, w, h, ctk.get_appearance_mode().lower())
+    adv.bind("<Configure>", draw_bg)
 
     adv.update_idletasks()
     x = parent.winfo_rootx() + (parent.winfo_width() - adv.winfo_width()) // 2
@@ -77,12 +86,17 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         if val:
             dither_menu.configure(state="normal")
             perf_switch.configure(state="normal")
+            invert_switch.configure(state="normal")
         else:
             dither_menu.configure(state="disabled")
             perf_switch.configure(state="disabled")
+            invert_switch.configure(state="disabled")
             if perf_var.get():
                 perf_var.set(False)
                 settings["performance_mode"] = False
+            if invert_var.get():
+                invert_var.set(False)
+                settings["invert_bw"] = False
         on_change_callback()
 
     bw_switch = ctk.CTkSwitch(
@@ -95,6 +109,24 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         progress_color=highlight_color
     )
     bw_switch.pack(anchor="w", pady=8)
+
+    invert_var = tk.BooleanVar(value=settings.get("invert_bw", False))
+    def toggle_invert():
+        settings["invert_bw"] = invert_var.get()
+        on_change_callback()
+
+    invert_switch = ctk.CTkSwitch(
+        frame,
+        text="Invert Display Colors",
+        font=fonts['small'],
+        text_color=main_color,
+        variable=invert_var,
+        command=toggle_invert,
+        progress_color=highlight_color
+    )
+    if not bw_var.get():
+        invert_switch.configure(state="disabled")
+    invert_switch.pack(anchor="w", pady=8)
 
     perf_var = tk.BooleanVar(value=settings.get("performance_mode", False))
     def toggle_perf():
