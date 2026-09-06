@@ -40,7 +40,7 @@ The DCIM structure for the 3DS is very much the same as the DSi, just different 
 | Other known features | Resizing, widecut, and proportionate images, DPI optimization | More resizing options such as title layout, additional filters, black/white/custom backgrounds, DCIM tree or Part_X tree exporting layouts, 3DS support, pit.bin deletion/detection confirmation|
 
 *Works natively under Wine <br />
-**Windows/Mac/Linux desktop only (I don't use Mac)
+**Desktop only
 
 ## What you need (for manually executing):
 - Python 3.14+ recommended
@@ -60,13 +60,13 @@ and then <br>
 
 
 Mac/Linux steps (or Windows optionally): <br>
-Like I mentioned above, I don't use Mac, so it's best to make a virtual environment. Open a terminal to where your venv should be saved:
+It's best to make a virtual environment, Linux refuses to run pip on the main system.
 ```
 python -m venv sfvenv
 
 source sfvenv/bin/activate
 
-cd SIGMAFLIP
+cd SIGMAFLIP # or wherever SIGMAFLIP's path is located
 
 pip install -r requirements.txt
 
@@ -85,7 +85,7 @@ python main.py
 https://github.com/user-attachments/assets/b0c372c4-e0da-4705-a62d-e6118309216f
 
 
-###### As of v1
+###### Demo video as of v1
 
 ## Limitations:
 ### Flipnote Memory Saver filter
