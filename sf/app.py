@@ -4,6 +4,7 @@ import time
 import io
 import shutil
 import json
+import queue
 import threading
 import subprocess
 import tempfile
@@ -18,12 +19,15 @@ from PIL import Image, ImageTk, ImageEnhance
 
 from sf.config import (
     IS_WINDOWS, IS_MAC, IS_LINUX, MAIN_COLOR, SUB_COLOR,
-    MAX_FRAMES, SPEED_FPS,
+    MAX_FRAMES, SPEED_FPS, VERSION, get_resource_path, get_icon_path,
     load_custom_font, WARNING_DURATION, draw_grid_on_canvas
 )
 from sf.about import show_about_dialog
 from sf.dither import (apply_ordered_dither, apply_error_diffusion,
                         apply_dot_diffusion, apply_riemersma, apply_woodcut)
+
+if IS_WINDOWS:
+    import ctypes
 
 try:
     from Crypto.Cipher import AES
@@ -138,6 +142,7 @@ class SIGMAFLIP:
 
         self.bg_type_var = tk.StringVar(value="black")
         self.export_structure_var = tk.StringVar(value="dcim")
+        self.export_mode_var = ctk.StringVar(value="Video Frames")
 
         self.audio_enabled = True
         self.bg_type = "black"
@@ -154,6 +159,7 @@ class SIGMAFLIP:
         }
 
         self.sfx_cache = {}
+        self._ui_queue = queue.Queue()
         try:
             pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
         except Exception:
@@ -172,6 +178,27 @@ class SIGMAFLIP:
         # Start a stable, version-independent theme polling loop
         self._last_mode = ctk.get_appearance_mode().lower()
         self.poll_appearance_mode()
+        self.root.after(80, self._ui_pump)
+
+    def _ui_call(self, fn):
+        """Schedule a callable to run on the main (Tk) thread. Thread-safe."""
+        self._ui_queue.put(fn)
+
+    def _ui_pump(self):
+        """Drains the main-thread dispatch queue. Runs callbacks on the Tk thread."""
+        try:
+            while True:
+                fn = self._ui_queue.get_nowait()
+                try:
+                    fn()
+                except Exception:
+                    sys.excepthook(*sys.exc_info())
+        except queue.Empty:
+            pass
+        try:
+            self.root.after(80, self._ui_pump)
+        except Exception:
+            pass
 
     def _cleanup_audio(self) -> None:
         """Stop pygame music, delete temp audio file, and reset audio state flags."""
@@ -314,11 +341,7 @@ class SIGMAFLIP:
             if not getattr(btn, "_sf_down_img", None):
                 return
             if time.time() - getattr(btn, "_sf_press_time", time.time()) > 0.25:
-                # Command may have swapped the icon during the hold (e.g. play/pause).
-                # Restore to the current icon instead of the stale press-time one.
-                cur = btn.cget("image")
-                restore_target = cur if cur is not btn._sf_down_img else getattr(btn, "_sf_restore_target", None)
-                btn.configure(image=restore_target)
+                btn.configure(image=getattr(btn, "_sf_restore_target", None))
                 btn._sf_down_img = None
                 btn._sf_restore_target = None
                 return
@@ -399,7 +422,7 @@ class SIGMAFLIP:
         self.bg_menu = tk.Menu(self.options_menu, tearoff=0, **menu_opts)
         self.options_menu.add_cascade(label="Background Setting", menu=self.bg_menu)
 
-        self.bg_menu.add_command(label="✓ Solid Black (Default)", command=lambda: self.set_bg_menu_type("black"))
+        self.bg_menu.add_command(label="✓ Solid Black", command=lambda: self.set_bg_menu_type("black"))
         self.bg_menu.add_command(label="   Solid White", command=lambda: self.set_bg_menu_type("white"))
         self.bg_menu.add_command(label="   Custom Background...", command=lambda: self.set_bg_menu_type("custom"))
 
@@ -453,7 +476,7 @@ class SIGMAFLIP:
             if not silent:
                 self.on_bg_type_change()
 
-        self.bg_menu.entryconfigure(0, label="✓ Solid Black (Default)" if self.bg_type_var.get() == "black" else "   Solid Black (Default)")
+        self.bg_menu.entryconfigure(0, label="✓ Solid Black" if self.bg_type_var.get() == "black" else "   Solid Black")
         self.bg_menu.entryconfigure(1, label="✓ Solid White" if self.bg_type_var.get() == "white" else "   Solid White")
         self.bg_menu.entryconfigure(2, label="✓ Custom Background..." if self.bg_type_var.get() == "custom" else "   Custom Background...")
 
@@ -486,7 +509,7 @@ class SIGMAFLIP:
                     "Delete it now so the console re-scans the new photos?")
             finally:
                 done.set()
-        self.root.after(0, ask)
+        self._ui_call(ask)
         done.wait()
         return result[0]
 
@@ -507,13 +530,73 @@ class SIGMAFLIP:
             return ""
         return f"\nDeleted stale album cache: {pit}"
 
+    def _validate_still_image(self, file_path):
+        """Validate an uploaded still without modifying its pixels or alpha."""
+        try:
+            with Image.open(file_path) as img:
+                img.verify()
+            with Image.open(file_path) as img:
+                width, height = img.size
+                if width < 1 or height < 1:
+                    raise ValueError("Image has invalid dimensions.")
+                # Output is ultimately 640x480; reject pathological allocations
+                # while allowing normal high-resolution source images.
+                if width * height > 100_000_000:
+                    raise ValueError("Image is too large to safely process (over 100 megapixels).")
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+
+    def _clear_background_cache(self):
+        cached = getattr(self, "_cached_bg_src", None)
+        if cached is not None:
+            try:
+                cached.close()
+            except Exception:
+                pass
+        self._cached_bg_src = None
+        self._cached_bg_path = None
+
+    def _get_custom_background(self, size, resample):
+        """Load a bounded RGB background copy; never touch foreground/GIF alpha."""
+        path = self.bg_image_path
+        if not path or not os.path.isfile(path):
+            return Image.new("RGB", size, "black")
+
+        try:
+            if getattr(self, "_cached_bg_path", None) != path or getattr(self, "_cached_bg_src", None) is None:
+                self._clear_background_cache()
+                with Image.open(path) as src:
+                    src.load()
+                    # The background is only ever rendered at the target canvas size.
+                    # Keep a bounded RGB copy rather than retaining a huge source image.
+                    cached = src.convert("RGB")
+                    cached.thumbnail((640, 480), Image.Resampling.LANCZOS)
+                    self._cached_bg_src = cached.copy()
+                self._cached_bg_path = path
+            return self._cached_bg_src.resize(size, resample)
+        except Exception as e:
+            print(f"Error loading Custom Background Fill: {e}")
+            self._clear_background_cache()
+            return Image.new("RGB", size, "black")
+
     def select_custom_bg_image(self):
-        """Launches file selector for custom image backgrounds on resized crops."""
+        """Select and validate a custom background before changing active settings."""
         file_path = filedialog.askopenfilename(
             title="Select Custom Background Frame Image",
             filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.webp")]
         )
         if file_path:
+            valid, error = self._validate_still_image(file_path)
+            if not valid:
+                self.play_sound('warning.mp3')
+                messagebox.showerror(
+                    "Invalid Background",
+                    f"That image could not be safely loaded:\n\n{error}\n\n"
+                    "Your current background setting has been kept unchanged."
+                )
+                return
+            self._clear_background_cache()
             self.bg_image_path = file_path
             self.bg_type = "custom"
             self.bg_type_var.set("custom")
@@ -537,7 +620,7 @@ class SIGMAFLIP:
     def on_struct_type_change(self):
         """Updates configurations and playbacks silently when toggling export modes."""
         self.play_sound('apply.mp3')
-        if self.cap or self.gif_img or self.image_paths:
+        if self.cap or self.image_paths:
             self.check_timing_warnings(show_popup=False)
 
     def show_about_dialog(self):
@@ -895,7 +978,7 @@ class SIGMAFLIP:
             val = self.tile_cols_entry.get()
             self.tile_rows_entry.delete(0, tk.END)
             self.tile_rows_entry.insert(0, val)
-        if self.cap or self.gif_img or self.image_paths:
+        if self.cap or self.image_paths:
             self.check_timing_warnings(show_popup=False)
         self.update_frame_display()
 
@@ -942,7 +1025,7 @@ class SIGMAFLIP:
 
     def sync_speed_widget_image(self):
         self.speed_widget.delete("speed_img")
-        is_enabled = (self.cap is not None or self.gif_img is not None) and (not self.playing)
+        is_enabled = (self.cap is not None) and (not self.playing)
         p_img = f"{self.speed}.png" if is_enabled else f"{self.speed}_disabled.png"
         p = os.path.join(self.img_path, p_img)
         if os.path.exists(p):
@@ -955,7 +1038,7 @@ class SIGMAFLIP:
         self.speed_widget.configure(bg=bg_color)
 
     def on_speed_widget_click(self, event):
-        if not (self.cap is not None or self.gif_img is not None) or self.playing:
+        if not self.cap or self.playing:
             return
         x = event.x
         adjusted_x = x + 4
@@ -971,7 +1054,7 @@ class SIGMAFLIP:
         self.speed = speed_idx
         self.sync_speed_widget_image()
         self.play_sound(f'speed{self.speed}.mp3')
-        if self.cap is not None or self.gif_img is not None:
+        if self.cap:
             self.check_timing_warnings(show_popup=False)
 
     def toggle_singular_view_mode(self):
@@ -1023,6 +1106,13 @@ class SIGMAFLIP:
 
         self._update_thumb_selection(old_idx, index)
         self.update_nav_buttons_state()
+
+    def double_click_grid_image(self, index):
+        """Callback to select and automatically switch viewport back to standard single editor canvas."""
+        self.play_sound('apply.mp3')
+        self.still_index = index
+        self.video_path = self.image_paths[self.still_index]
+        self.switch_to_preview_view()
 
     def show_grid_tooltip(self, event, filename):
         """Generates a floating tooltip showing the full un-truncated image filename on hover."""
@@ -1231,7 +1321,7 @@ class SIGMAFLIP:
     def move_frame_left(self):
         """Shifts selected image index left, swaps cells in-place."""
         if self.still_index > 0:
-            self.play_sound('apply.mp3')
+            self.play_sound('moveleft.mp3')
             idx = self.still_index
             self.image_paths[idx], self.image_paths[idx - 1] = self.image_paths[idx - 1], self.image_paths[idx]
             self.still_index -= 1
@@ -1243,7 +1333,7 @@ class SIGMAFLIP:
     def move_frame_right(self):
         """Shifts selected image index right, swaps cells in-place."""
         if self.still_index < len(self.image_paths) - 1:
-            self.play_sound('apply.mp3')
+            self.play_sound('moveright.mp3')
             idx = self.still_index
             self.image_paths[idx], self.image_paths[idx + 1] = self.image_paths[idx + 1], self.image_paths[idx]
             self.still_index += 1
@@ -1438,40 +1528,6 @@ class SIGMAFLIP:
             )
             self.export_btn.configure(text="Export Frames")
 
-    def _safe_askopenfilename(self, **kwargs):
-        """Run the native file picker while keeping application state quiescent."""
-        was_playing = self.playing
-        if was_playing:
-            self.toggle_play()
-        try:
-            self.root.update_idletasks()
-            return filedialog.askopenfilename(parent=self.root, **kwargs)
-        except Exception as exc:
-            print(f"[SIGMAFLIP] File dialog error: {exc}")
-            return ""
-        finally:
-            try:
-                self.root.update_idletasks()
-            except Exception:
-                pass
-
-    def _safe_askopenfilenames(self, **kwargs):
-        """Run the native multi-file picker with the same safety boundary."""
-        was_playing = self.playing
-        if was_playing:
-            self.toggle_play()
-        try:
-            self.root.update_idletasks()
-            return filedialog.askopenfilenames(parent=self.root, **kwargs)
-        except Exception as exc:
-            print(f"[SIGMAFLIP] File dialog error: {exc}")
-            return ()
-        finally:
-            try:
-                self.root.update_idletasks()
-            except Exception:
-                pass
-
     def load_video_dialog(self):
         # Stop any active playback before loading new media
         if self.playing:
@@ -1482,14 +1538,41 @@ class SIGMAFLIP:
         # Adjust accepted dialog extensions based on Export mode selections
         if self.export_mode_var.get() == "Singular Image":
             # Multi-image selection support
-            file_paths = self._safe_askopenfilenames(
+            file_paths = filedialog.askopenfilenames(
                 filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.webp")]
             )
             if not file_paths:
                 self.play_sound('back.mp3')
                 return
 
-            self.image_paths = list(file_paths)
+            valid_paths = []
+            invalid_files = []
+            for selected_path in file_paths:
+                valid, error = self._validate_still_image(selected_path)
+                if valid:
+                    valid_paths.append(selected_path)
+                else:
+                    invalid_files.append(f"{os.path.basename(selected_path)}: {error}")
+
+            if not valid_paths:
+                self.play_sound('warning.mp3')
+                messagebox.showerror(
+                    "No Valid Images",
+                    "None of the selected images could be safely loaded.\n\n"
+                    + "\n".join(invalid_files[:8])
+                )
+                return
+
+            if invalid_files:
+                self.play_sound('warning.mp3')
+                messagebox.showwarning(
+                    "Some Images Skipped",
+                    "The following files were skipped because they could not be safely loaded:\n\n"
+                    + "\n".join(invalid_files[:8])
+                    + ("\n\nAdditional invalid files were also skipped." if len(invalid_files) > 8 else "")
+                )
+
+            self.image_paths = valid_paths
             self.still_index = 0
             self.video_path = self.image_paths[self.still_index]  # Store first file path
             
@@ -1513,7 +1596,7 @@ class SIGMAFLIP:
             return
 
         # Standard Video Processing
-        file_path = self._safe_askopenfilename(
+        file_path = filedialog.askopenfilename(
             filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv *.gif")]
         )
         if not file_path:
@@ -1522,11 +1605,11 @@ class SIGMAFLIP:
 
         if self.cap:
             self.cap.release()
-            self.cap = None
         if self.gif_img:
             self.gif_img.close()
             self.gif_img = None
 
+        # Stop previous audio tracking and cleanup previous audio file
         self._cleanup_audio()
 
         self.video_path = file_path
@@ -1534,57 +1617,34 @@ class SIGMAFLIP:
         self.file_name_label.configure(text=os.path.basename(file_path))
         self.export_btn.configure(state="normal")
 
-        if file_path.lower().endswith('.gif'):
-            try:
-                self.gif_img = Image.open(file_path)
-                self.total_video_frames = max(1, int(getattr(self.gif_img, "n_frames", 1)))
-                self.gif_img.seek(0)
-                first_duration_ms = max(1, int(self.gif_img.info.get("duration", 100)))
-                self.video_fps = max(1.0, min(1000.0, 1000.0 / first_duration_ms))
-                self.video_duration = self.total_video_frames / self.video_fps
-            except Exception as exc:
-                if self.gif_img:
-                    try:
-                        self.gif_img.close()
-                    except Exception:
-                        pass
-                    self.gif_img = None
-                self.video_path = None
-                self.export_btn.configure(state="disabled")
-                messagebox.showerror("GIF Load Error", f"Could not open this GIF.\\n\\n{exc}")
-                return
-
-            self.play_btn.configure(state="normal")
-            self.current_frame_idx = 0.0
-            self.timeline_slider.configure(from_=0, to=self.total_video_frames - 1)
-            self.timeline_slider.set(0)
-            self.sync_speed_widget_image()
-            self.check_timing_warnings(show_popup=False)
-            self.update_frame_display()
-            return
-
-        # Non-GIF video: OpenCV handles the container.
+        # Standard video processing initialization
         self.cap = cv2.VideoCapture(file_path)
-        if not self.cap.isOpened():
-            self.cap.release()
-            self.cap = None
-            self.video_path = None
-            self.export_btn.configure(state="disabled")
-            messagebox.showerror("Video Load Error", "The selected video could not be opened by the installed video backend.")
-            return
-
         self.total_video_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.video_fps = self.cap.get(cv2.CAP_PROP_FPS)
         if self.video_fps <= 0:
             self.video_fps = 24.0
-
+        if file_path.lower().endswith('.gif') and self.total_video_frames > 1:
+            try:
+                self.gif_img = Image.open(file_path)
+                total_ms = 0
+                for i in range(getattr(self.gif_img, 'n_frames', self.total_video_frames)):
+                    self.gif_img.seek(i)
+                    total_ms += self.gif_img.info.get('duration', 100)
+                self.gif_img.seek(0)
+                if total_ms > 0:
+                    self.video_fps = self.total_video_frames / (total_ms / 1000.0)
+            except Exception:
+                if self.gif_img:
+                    self.gif_img.close()
+                    self.gif_img = None
+        # Container metadata often overcounts by 1+ (undecodable last frame); trust
+        # only what actually decodes, or the export estimate overshoots by that amount.
         while self.total_video_frames > 1:
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.total_video_frames - 1)
             ret, _ = self.cap.read()
             if ret:
                 break
             self.total_video_frames -= 1
-
         self.video_duration = self.total_video_frames / self.video_fps
 
         self.play_btn.configure(state="normal")
@@ -1716,7 +1776,7 @@ class SIGMAFLIP:
         try:
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
             if os.path.exists(self.temp_audio_path) and os.path.getsize(self.temp_audio_path) > 0:
-                self.root.after(0, self.load_extracted_audio)
+                self._ui_call(self.load_extracted_audio)
         except Exception:
             pass
 
@@ -1730,9 +1790,6 @@ class SIGMAFLIP:
     def check_timing_warnings(self, show_popup=False):
         """Processes video frame warnings preventing continuous dialog prompts during slider changes."""
         if self.export_mode_var.get() == "Singular Image":
-            self.update_indicator_metrics(0)
-            return
-        if self.cap is None and self.gif_img is None:
             self.update_indicator_metrics(0)
             return
 
@@ -1799,7 +1856,7 @@ class SIGMAFLIP:
             else:
                 self.repack_video_layout()
                 
-        if self.cap or self.gif_img or self.image_paths:
+        if self.cap or self.image_paths:
             self.check_timing_warnings(show_popup=False)
         self.update_frame_display()
 
@@ -1888,16 +1945,23 @@ class SIGMAFLIP:
         self.video_canvas.create_image(canvas_w // 2, canvas_h // 2, image=self.tk_image, anchor="center")
 
     def apply_advanced_filters(self, img):
+        """Apply visual filters without ever altering an existing alpha channel."""
         settings = self.advanced_settings
-        
+
+        # Alpha is part of the foreground compositing contract. Keep it completely
+        # separate from RGB/L processing so GIF transparency survives every filter.
+        img = img.convert("RGBA")
+        alpha = img.getchannel("A")
+        rgb_img = img.convert("RGB")
+
         contrast_val = settings.get("contrast", 1.0)
         perf_skip = settings.get("performance_mode", False) and self.playing
         if contrast_val != 1.0 and not perf_skip:
-            enhancer = ImageEnhance.Contrast(img.convert("RGB"))
-            img = enhancer.enhance(contrast_val).convert("RGBA")
+            enhancer = ImageEnhance.Contrast(rgb_img)
+            rgb_img = enhancer.enhance(contrast_val)
 
         if settings.get("black_and_white", False):
-            gray_img = img.convert("L")
+            gray_img = rgb_img.convert("L")
             dither = settings.get("dither_mode", "None")
 
             if dither == "Floyd-Steinberg":
@@ -1910,11 +1974,11 @@ class SIGMAFLIP:
             elif dither in ("Bayer 2x2", "Bayer 3x3", "Bayer 4x4", "Bayer 8x8",
                             "Bayer 16x16", "Bayer 32x32", "Blue Noise 64x64",
                             "Halftone", "Flipnote Memory Saver (Experimental)"):
-                bw_img = apply_ordered_dither(gray_img, dither)
+                bw_img = self.apply_ordered_dither(gray_img, dither)
             elif dither in ("Atkinson", "Jarvis-Judice-Ninke", 
                             "Sierra 3-Row", "Sierra Lite",
                             "Stevenson-Arce"):
-                bw_img = apply_error_diffusion(gray_img, dither, self._exporting, self._rapid_rendering)
+                bw_img = self.apply_error_diffusion(gray_img, dither)
             elif dither == "Dot Diffusion":
                 bw_img = apply_dot_diffusion(gray_img, self._exporting, self._rapid_rendering)
             elif dither == "Riemersma":
@@ -1924,13 +1988,26 @@ class SIGMAFLIP:
             else:
                 bw_img = gray_img.point(lambda x: 255 if x > 127 else 0, mode="1")
             
-            img = bw_img.convert("RGBA")
+            # Reattach the original alpha unchanged. B/W/dither operations affect
+            # luminance only; transparent GIF pixels remain transparent.
+            if settings.get("invert_bw", False):
+                bw_img = bw_img.convert("L").point(lambda x: 255 - x)
+            rgb_img = bw_img.convert("RGB")
 
-        return img
+        rgb_img.putalpha(alpha)
+        return rgb_img
+
+    def apply_ordered_dither(self, gray_img, mode):
+        """Standardized routing mapping ordered dither patterns through Modular Dither library."""
+        return apply_ordered_dither(gray_img, mode)
+
+    def apply_error_diffusion(self, gray_img, kernel_name):
+        """Standardized routing mapping error diffusion patterns through Modular Dither library."""
+        return apply_error_diffusion(gray_img, kernel_name, self._exporting, self._rapid_rendering)
 
     def apply_scaling_to_image(self, img, target_w, target_h):
         orig_w, orig_h = img.size
-        bg_type = self.bg_type_var.get()
+        bg_type = self.bg_type
         
         # Determine internal scaling parameters
         pixel_precision = self.advanced_settings.get("pixel_precision", False)
@@ -1951,16 +2028,8 @@ class SIGMAFLIP:
         # Resolve Background Canvas
         if bg_type == "white":
             bg = Image.new("RGB", (render_w, render_h), "white")
-        elif bg_type == "custom" and self.bg_image_path and os.path.exists(self.bg_image_path):
-            try:
-                # Cache the raw background image; only reload when path changes
-                if not hasattr(self, '_cached_bg_path') or self._cached_bg_path != self.bg_image_path:
-                    self._cached_bg_src = Image.open(self.bg_image_path).convert("RGB")
-                    self._cached_bg_path = self.bg_image_path
-                bg = self._cached_bg_src.resize((render_w, render_h), scale_resample)
-            except Exception as e:
-                print(f"Error loading Custom Background Fill: {e}")
-                bg = Image.new("RGB", (render_w, render_h), "black")
+        elif bg_type == "custom":
+            bg = self._get_custom_background((render_w, render_h), scale_resample)
         else:
             bg = Image.new("RGB", (render_w, render_h), "black")
             
@@ -1993,16 +2062,9 @@ class SIGMAFLIP:
             bg_final = bg
             
         elif self.scale_mode == "Fit":
-            if orig_w <= target_w and orig_h <= target_h:
-                final_w, final_h = orig_w, orig_h
-            else:
-                fit_scale = min(target_w / orig_w, target_h / orig_h)
-                final_w = max(1, int(orig_w * fit_scale))
-                final_h = max(1, int(orig_h * fit_scale))
-            paste_w = max(1, round(final_w * render_w / target_w))
-            paste_h = max(1, round(final_h * render_h / target_h))
-            img_copy = img_rgba.resize((paste_w, paste_h), scale_resample)
-            bg.paste(img_copy, ((render_w - paste_w) // 2, (render_h - paste_h) // 2), mask=img_copy)
+            img_copy = img_rgba.copy()
+            img_copy.thumbnail((render_w, render_h), scale_resample)
+            bg.paste(img_copy, ((render_w - img_copy.width) // 2, (render_h - img_copy.height) // 2), mask=img_copy)
             bg_final = bg
         elif self.scale_mode == "Stretch":
             img_copy = img_rgba.resize((render_w, render_h), scale_resample)
@@ -2022,8 +2084,9 @@ class SIGMAFLIP:
         # Apply advanced filters to this layout frame buffer
         filtered = self.apply_advanced_filters(bg_final)
 
+        # Upscale frame back to standard preview dimensions
         if render_w != target_w or render_h != target_h:
-            filtered = filtered.resize((target_w, target_h), Image.Resampling.LANCZOS)
+            filtered = filtered.resize((target_w, target_h), scale_resample)
 
         return filtered
 
@@ -2050,7 +2113,7 @@ class SIGMAFLIP:
             self.start_audio_at_current_frame()
 
     def toggle_play(self):
-        if not (self.cap is not None or self.gif_img is not None) or (self.export_mode_var.get() == "Singular Image"):
+        if not self.cap or (self.export_mode_var.get() == "Singular Image"):
             return
 
         if self.playing:
@@ -2144,6 +2207,7 @@ class SIGMAFLIP:
         delay_ms = max(0, int((next_at - elapsed) * 1000))
         self.after_play_id = self.root.after(delay_ms, self.playback_tick)
 
+    DSI_SIG_PADDING = 512  # bytes of COM comment padding for signature area
     DSI_JPEG_KEY = bytes.fromhex("70885206DFE5016D45EAC52333D6446F")  # DSi photo AES key (from DSi bootrom)
     DSI_NATIVE_W = 256
     DSI_NATIVE_H = 192
@@ -2309,21 +2373,6 @@ class SIGMAFLIP:
         """Encodes, signs, and programmatically verifies a frame.
         If verification fails or the file size is too large for the 3DS memory limits,
         it dynamically adjusts encoding parameters to secure a valid, lightweight file."""
-        if pil_img.mode == "RGBA":
-            bg_type = self.bg_type_var.get()
-            if bg_type == "white":
-                flat = Image.new("RGB", pil_img.size, (255, 255, 255))
-            elif bg_type == "custom" and self.bg_image_path and os.path.exists(self.bg_image_path):
-                try:
-                    flat = Image.open(self.bg_image_path).convert("RGB")
-                    flat = flat.resize(pil_img.size, Image.Resampling.NEAREST)
-                except Exception:
-                    flat = Image.new("RGB", pil_img.size, (0, 0, 0))
-            else:
-                flat = Image.new("RGB", pil_img.size, (0, 0, 0))
-            flat.paste(pil_img, mask=pil_img.split()[3])
-            pil_img = flat
-
         quality = 95
         MAX_FILE_SIZE = 140000  # 140 KB limit to prevent 3DS decoder out-of-memory errors
 
@@ -2424,7 +2473,7 @@ class SIGMAFLIP:
                         signed_count += 1
                     except Exception as e:
                         print(f"Error processing {os.path.basename(src)} inside {os.path.basename(part_dir)}: {e}")
-                    self.root.after(0, lambda p=(signed_count / max(1, total)): self.progress_bar.set(p))
+                    self._ui_call(lambda p=(signed_count / max(1, total)): self.progress_bar.set(p))
                     frame_index += 1
         return signed_count, folder_sets
 
@@ -2436,20 +2485,20 @@ class SIGMAFLIP:
             signed_count, folder_sets = self._sign_and_partition(
                 output_dir, self.image_paths, base_time, remove_sources=False)
 
-            self.play_sound('apply.mp3')
+            self._ui_call(lambda: self.play_sound('apply.mp3'))
             cache_note = self._cleanup_dsi_album_cache(output_dir) if self.console_type == "dsi" else ""
-            self.root.after(0, lambda note=cache_note: messagebox.showinfo(
+            self._ui_call(lambda note=cache_note: messagebox.showinfo(
                 "Export Complete", 
                 f"Successfully formatted, signed, and grouped {signed_count} still images into selected directory layout!"
                 + note
             ))
         except Exception as e:
-            self.play_sound('warning.mp3')
-            self.root.after(0, lambda err=e: messagebox.showerror("Export Failure", f"An error occurred during batch still export:\n{str(err)}"))
+            self._ui_call(lambda: self.play_sound('warning.mp3'))
+            self._ui_call(lambda err=e: messagebox.showerror("Export Failure", f"An error occurred during batch still export:\n{str(err)}"))
         finally:
             self._exporting = False
-            self.root.after(0, lambda: self.toggle_widgets_interactive_state(enabled=True))
-            self.root.after(0, lambda: self.progress_bar.set(1.0))
+            self._ui_call(lambda: self.toggle_widgets_interactive_state(enabled=True))
+            self._ui_call(lambda: self.progress_bar.set(1.0))
 
     def export_frames(self) -> None:
         if not self.video_path and not self.image_paths:
@@ -2522,161 +2571,128 @@ class SIGMAFLIP:
             self.play_sound('back.mp3')
             return
 
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if not ffmpeg_bin:
+            self.play_sound('warning.mp3')
+            messagebox.showerror(
+                "Export Error", "FFmpeg executable was not found on your system PATH.\n\nPlease install FFmpeg to run export pipelines."
+            )
+            return
+
         self.progress_bar.set(0)
         self.toggle_widgets_interactive_state(enabled=False)
 
-        export_snapshot = {
-            "speed": self.speed,
-            "video_fps": self.video_fps,
-            "total_video_frames": self.total_video_frames,
-            "bg_type": self.bg_type_var.get(),
-            "bg_image_path": self.bg_image_path,
-            "scale_mode": self.scale_mode,
-            "video_path": self.video_path,
-            "console_type": self.console_type,
-        }
+        # Snapshot Tk-backed state before entering the worker thread. Tkinter
+        # variables must never be read from a background thread.
+        export_bg_type = self.bg_type_var.get()
         export_thread = threading.Thread(
             target=self.run_ffmpeg_export_pipeline,
-            args=(target_dir, export_snapshot),
+            args=(target_dir, ffmpeg_bin, export_bg_type),
             daemon=True
         )
         export_thread.start()
 
-    def run_ffmpeg_export_pipeline(self, output_dir: str, snapshot: dict) -> None:
-        target_fps = SPEED_FPS[snapshot["speed"]]
-        frame_step = max(1, round(snapshot["video_fps"] / target_fps))
-        frame_limit = (snapshot["total_video_frames"] - 1) // frame_step + 1
-        video_path = snapshot["video_path"]
+    def run_ffmpeg_export_pipeline(self, output_dir: str, ffmpeg_path: str, bg_type: str = "black") -> None:
+        target_fps = SPEED_FPS[self.speed]
+        frame_step = max(1, round(self.video_fps / target_fps))
+        frame_limit = (self.total_video_frames - 1) // frame_step + 1
 
-        cap = None
-        gif_img = None
+        frame_sel = f"select='eq(mod(n,{frame_step}),0)'"
+        if self.scale_mode == "Fit":
+            if bg_type == "custom" and self.bg_image_path and os.path.exists(self.bg_image_path):
+                # Custom PNG/JPG file overlay complex layout map
+                filter_complex = (
+                    f"[0:v]{frame_sel},scale=640:480:force_original_aspect_ratio=decrease[fg];"
+                    f"[1:v]scale=640:480,fps={target_fps}[bg];"
+                    f"[bg][fg]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2"
+                )
+                cmd = [
+                    ffmpeg_path, "-y", 
+                    "-i", self.video_path,
+                    "-i", self.bg_image_path,
+                    "-fps_mode", "vfr",
+                    "-filter_complex", filter_complex,
+                    "-frames:v", str(frame_limit),
+                    "-q:v", "2", os.path.join(output_dir, "HNI_%04d.JPG")
+                ]
+            else:
+                color_str = "white" if bg_type == "white" else "black"
+                vf_filter = f"{frame_sel},scale=640:480:force_original_aspect_ratio=decrease,pad=640:480:(ow-iw)/2:(oh-ih)/2:color={color_str}"
+                cmd = [
+                    ffmpeg_path, "-y", "-i", self.video_path,
+                    "-fps_mode", "vfr",
+                    "-vf", vf_filter, 
+                    "-frames:v", str(frame_limit),
+                    "-q:v", "2", os.path.join(output_dir, "HNI_%04d.JPG")
+                ]
+        else:
+            # Stretch, Crop or Tiles (Tiles utilizes centered aspects with post-process drawing overrides in Python!)
+            if self.scale_mode == "Stretch":
+                vf_filter = f"{frame_sel},scale=640:480"
+            else: 
+                # Tiles and Tiles Stretched unpadded boundaries which our Python post-processor tiles beautifully!
+                if self.scale_mode in ("Tiles", "Tiles Stretched"):
+                    vf_filter = f"{frame_sel},scale=640:480:force_original_aspect_ratio=decrease"
+                else: # Crop Mode
+                    vf_filter = f"{frame_sel},scale=640:480:force_original_aspect_ratio=increase,crop=640:480"
+                
+            cmd = [
+                ffmpeg_path, "-y", "-i", self.video_path,
+                "-fps_mode", "vfr",
+                "-vf", vf_filter, 
+                "-frames:v", str(frame_limit),
+                "-q:v", "2", os.path.join(output_dir, "HNI_%04d.JPG")
+            ]
+
         try:
             self._exporting = True
-            is_gif = video_path.lower().endswith(".gif")
-            if is_gif:
-                gif_img = Image.open(video_path)
-            else:
-                cap = cv2.VideoCapture(video_path)
-
-            base_time = time.time()
-            signed_sources = []
-            for n in range(frame_limit):
-                idx = n * frame_step
-                pil_img = self._render_export_frame(cap, gif_img, idx)
-                if pil_img is None:
-                    continue
-                time_str = time.strftime("%Y:%m:%d %H:%M:%S", time.localtime(base_time + n * 2))
-                out = os.path.join(output_dir, f"HNI_{n + 1:04d}.JPG")
-                self.encode_and_sign_frame_safe(pil_img, time_str, out)
-                signed_sources.append(out)
-                self.root.after(0, lambda p=(n + 1) / max(1, frame_limit): self.progress_bar.set(p))
-
-            signed_count, folder_sets = self._partition_signed_frames(
-                output_dir, signed_sources, base_time)
-
-            self.play_sound('apply.mp3')
-            self.root.after(0, lambda: self.file_name_label.configure(text=os.path.basename(video_path), text_color=SUB_COLOR))
-            cache_note = self._cleanup_dsi_album_cache(output_dir) if self.console_type == "dsi" else ""
-            self.root.after(0, lambda c=signed_count, p=folder_sets, note=cache_note: messagebox.showinfo(
-                "Export Complete", f"Successfully exported, timestamped, and signed {c} frames grouped into {p} folder sets!"
-                + note
-            ))
-        except Exception as e:
-            self.play_sound('warning.mp3')
-            self.root.after(0, lambda err=e: messagebox.showerror("Pipeline Failure", f"An error occurred:\n{str(err)}"))
-        finally:
-            if cap is not None:
-                cap.release()
-            if gif_img is not None:
-                gif_img.close()
-            self._exporting = False
-            self.root.after(0, lambda: self.toggle_widgets_interactive_state(enabled=True))
-            self.root.after(0, lambda: self.progress_bar.set(1.0))
-
-    def _render_export_frame(self, cap, gif_img, frame_idx):
-        """Render a single frame exactly like the preview (WYSIWYG), returning a
-        final 640x480 RGB image (RGBA flattened onto the selected background)."""
-        if gif_img is not None:
-            try:
-                gif_img.seek(int(frame_idx))
-                pil_img = gif_img.convert("RGBA")
-            except Exception:
-                return None
-        elif cap is not None:
-            current_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-            if int(frame_idx) != current_pos:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
-            ret, frame = cap.read()
-            if not ret:
-                return None
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_img = Image.fromarray(frame)
-        else:
-            return None
-
-        pil_img = self.apply_scaling_to_image(pil_img, 640, 480)
-
-        # Flatten any remaining RGBA onto the selected background, same as preview
-        if pil_img.mode == "RGBA":
-            bg_type = self.bg_type_var.get()
-            if bg_type == "white":
-                flat = Image.new("RGB", pil_img.size, (255, 255, 255))
-            elif bg_type == "custom" and self.bg_image_path and os.path.exists(self.bg_image_path):
-                try:
-                    flat = Image.open(self.bg_image_path).convert("RGB")
-                    flat = flat.resize(pil_img.size, Image.Resampling.NEAREST)
-                except Exception:
-                    flat = Image.new("RGB", pil_img.size, (0, 0, 0))
-            else:
-                flat = Image.new("RGB", pil_img.size, (0, 0, 0))
-            flat.paste(pil_img, mask=pil_img.split()[3])
-            pil_img = flat
-
-        pil_img.info.clear()
-        return pil_img
-
-    def _partition_signed_frames(self, output_dir: str, sources: list[str], base_time: float) -> tuple[int, int]:
-        """Move already-signed HNI frames into the selected DCIM/Parts layout without
-        re-processing them, mirroring _sign_and_partition's GBATEK folder structure.
-        Returns (signed_count, folder_set_count)."""
-        batch_size = max(1, int(self.advanced_settings.get("album_capacity", 100)))
-        dsi_suffix = "NIN02" if self.console_type == "dsi" else "NIN01"
-        use_parts = (self.export_structure == "parts")
-
-        total = len(sources)
-        signed_count = 0
-        folder_sets = 0
-        frame_index = 0
-
-        if use_parts:
-            batches = [("", sources)]
-        else:
-            batches = []
-            for i in range(0, total, batch_size):
-                label = "DCIM" if i == 0 else f"DCIM_{i // batch_size + 1}"
-                batches.append((label, sources[i:i + batch_size]))
-
-        for batch_label, batch in batches:
-            for part_idx, chunk in enumerate([batch[i:i + 100] for i in range(0, len(batch), 100)]):
-                if use_parts:
-                    part_dir = os.path.join(output_dir, f"Part_{part_idx + 1}")
-                else:
-                    part_dir = os.path.join(output_dir, batch_label, f"{100 + part_idx}{dsi_suffix}")
-                os.makedirs(part_dir, exist_ok=True)
-                folder_sets += 1
-                for file_idx, src in enumerate(chunk):
-                    frame_time = base_time + frame_index * 2
-                    out_filename = f"HNI_{file_idx + 1:04d}.JPG"
-                    new_filepath = os.path.join(part_dir, out_filename)
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+            expected_frames = frame_limit
+            while True:
+                line = process.stderr.readline()
+                if not line:
+                    break
+                if "frame=" in line:
                     try:
-                        shutil.move(src, new_filepath)
-                        os.utime(new_filepath, (frame_time, frame_time))
-                        signed_count += 1
-                    except Exception as e:
-                        print(f"Error moving {os.path.basename(src)}: {e}")
-                    self.root.after(0, lambda p=(signed_count / max(1, total)): self.progress_bar.set(p))
-                    frame_index += 1
-        return signed_count, folder_sets
+                        parts = line.split("frame=")[1].strip().split()
+                        curr_exported_frame = int(parts[0])
+                        progress_val = min(1.0, curr_exported_frame / max(1, expected_frames))
+                        self._ui_call(lambda p=progress_val: self.progress_bar.set(p))
+                    except Exception:
+                        pass
+            process.wait()
+            
+            # Post-Processing: Sort files alphabetically, inject current timestamp, partition into folder sets of 100, and sign
+            if process.returncode == 0:
+                self._ui_call(lambda: self.file_name_label.configure(text="Timestamping, Signing & Splitting...", text_color=MAIN_COLOR))
+
+                temp_filenames = sorted([
+                    f for f in os.listdir(output_dir)
+                    if f.lower().endswith((".jpg", ".jpeg"))
+                ])
+
+                base_time = time.time()
+                sources = [os.path.join(output_dir, f) for f in temp_filenames]
+                signed_count, folder_sets = self._sign_and_partition(
+                    output_dir, sources, base_time, remove_sources=True)
+
+                self._ui_call(lambda: self.play_sound('apply.mp3'))
+                self._ui_call(lambda: self.file_name_label.configure(text=os.path.basename(self.video_path), text_color=SUB_COLOR))
+                cache_note = self._cleanup_dsi_album_cache(output_dir) if self.console_type == "dsi" else ""
+                self._ui_call(lambda c=signed_count, p=folder_sets, note=cache_note: messagebox.showinfo(
+                    "Export Complete", f"Successfully exported, timestamped, and signed {c} frames grouped into {p} folder sets!"
+                    + note
+                ))
+            else:
+                self._ui_call(lambda: self.play_sound('warning.mp3'))
+                self._ui_call(lambda: messagebox.showerror("Export Failed", "The FFmpeg subprocess returned an error execution code."))
+        except Exception as e:
+            self._ui_call(lambda: self.play_sound('warning.mp3'))
+            self._ui_call(lambda err=e: messagebox.showerror("Pipeline Failure", f"An error occurred:\n{str(err)}"))
+        finally:
+            self._exporting = False
+            self._ui_call(lambda: self.toggle_widgets_interactive_state(enabled=True))
+            self._ui_call(lambda: self.progress_bar.set(1.0))
 
     def toggle_widgets_interactive_state(self, enabled: bool) -> None:
         """Disables controls during background conversions preventing parameter disruptions."""
@@ -2713,6 +2729,6 @@ class SIGMAFLIP:
         if self.after_play_id:
             self.root.after_cancel(self.after_play_id)
             
-        self.save_user_settings()
-        self.purge_pycache_directories()
+        self.save_user_settings()      # Saves current parameters automatically
+        self.purge_pycache_directories() # Deletes __pycache__ compiles silently
         self.root.destroy()
