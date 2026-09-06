@@ -1,3 +1,4 @@
+# sf/about.py
 import os
 import customtkinter as ctk
 import tkinter as tk
@@ -21,7 +22,15 @@ def show_about_dialog(parent, fonts, icon_path, main_color, sub_color, highlight
     bg_canvas = tk.Canvas(about, bg="#1a1a1a", highlightthickness=0, bd=0)
     bg_canvas.place(x=0, y=0, relwidth=1, relheight=1)
 
-    about.bind("<Configure>", lambda e: draw_grid_on_canvas(bg_canvas, about.winfo_width(), about.winfo_height(), ctk.get_appearance_mode().lower()))
+    last_grid = {"w": 0, "h": 0}
+    def draw_bg(event=None):
+        w = about.winfo_width()
+        h = about.winfo_height()
+        if w == last_grid["w"] and h == last_grid["h"]:
+            return
+        last_grid.update(w=w, h=h)
+        draw_grid_on_canvas(bg_canvas, w, h, ctk.get_appearance_mode().lower())
+    about.bind("<Configure>", draw_bg)
 
     frame = ctk.CTkFrame(about, fg_color="transparent")
     frame.pack(fill=tk.BOTH, expand=True, padx=25, pady=20)
