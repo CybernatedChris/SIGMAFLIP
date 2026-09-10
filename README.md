@@ -4,7 +4,7 @@
   <img src="https://github.com/CybernatedChris/SIGMAFLIP/blob/main/sf/assets/img/sigma.png">
 </h1>
 
-A FOSS Python alternative to the traditional SignaPic DSi, with video frame splitting and other rich features.
+The ultimate tool for shitposting on Flipnote Studio. Or in other words, a FOSS Python alternative to the traditional SignaPic DSi, with video frame splitting and other rich features.
 
 > [!WARNING]
 > While this tool only signs pictures/split video frames into readable JPEGs, I am NOT liable on what you use this tool for or what content you convert. Please proceed at your own risk!
@@ -37,7 +37,7 @@ The DCIM structure for the 3DS is very much the same as the DSi, just different 
 | Video support? | ❌ | ✔ |
 | File Format | JPEG only   | PNG, JPEG/JPG, WEBP, BMP (Singular Image) MP4 AVI MOV MKV GIF (Video Frames)|
 | Last Activity | around 2019 to 2022 | 2026 and beyond (until I say so) |
-| Other known features | Resizing, widecut, and proportionate images, DPI optimization | More resizing options such as title layout, additional filters, black/white/custom backgrounds, DCIM tree or Part_X tree exporting layouts, 3DS support, pit.bin deletion/detection confirmation|
+| Other known features | Resizing, widecut, and proportionate images, DPI optimization | More resizing options such as title layout, additional filters, black/white/custom backgrounds, display inversion, DCIM tree or Part_X tree exporting layouts, 3DS support, pit.bin deletion/detection confirmation|
 
 *Works natively under Wine <br />
 **Desktop only
@@ -79,13 +79,15 @@ python main.py
 <img width="502" height="632" alt="imageselector" src="https://github.com/user-attachments/assets/083ce05a-21e2-462d-8f20-fbd0fa9c3be9" />
 <img width="502" height="632" alt="imgselectorbulkpreview" src="https://github.com/user-attachments/assets/6b4f1c35-c63e-4b69-9e38-5d33df13be1d" />
 
-## Video Demo
-
-
+## Video Demos:
+### Running on Windows 10 LTSC 21h2
 https://github.com/user-attachments/assets/b0c372c4-e0da-4705-a62d-e6118309216f
-
-
 ###### Demo video as of v1
+
+### Running on Hannah Montana Linux 26
+https://github.com/user-attachments/assets/0b2bb66f-1678-4088-b2b9-e8ef4a67d861
+###### Demo video as of v1.2.1
+
 
 ## Limitations:
 ### Flipnote Memory Saver filter
