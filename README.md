@@ -92,15 +92,16 @@ https://github.com/user-attachments/assets/0b2bb66f-1678-4088-b2b9-e8ef4a67d861
 ## Limitations:
 ### Flipnote Memory Saver filter
 
-The Flipnote Memory Saver filter is experimental. When you use the filter in Flipnote Studio, you must move the cursor at this spot: <br />
-<img width="350" height="526" alt="memsavelocator" src="https://github.com/user-attachments/assets/677546e2-63b8-4a66-8a07-afdfe8e98dd8" /> <br />
+The Flipnote Memory Saver filter is experimental. When you use the filter in Flipnote Studio, you must move the cursor at any of these spots, depending if you applied display inversion: <br />
+<h3 align="center">
+  <img width="350" height="526" alt="memsavelocator" src="https://github.com/user-attachments/assets/677546e2-63b8-4a66-8a07-afdfe8e98dd8" />
+  <img width="350" height="526" alt="memsavelocatorinvertoption" src="https://github.com/user-attachments/assets/19a8eb2f-5bf3-456e-ad1b-e8f1f362cccb" />
+</h3>
+Picture without display inversion is on the left, picture with display inversion is on the right. You can revert the inverted picture back by changing the page to black on Flipnote Studio.
 Your image may appear darker/lighter than expected, use the contrast settings.
 
 ### Video/GIF Frame Exporting
 Sometimes, videos/GIFs could have a low frame count. When you increase your speed, your videos/GIFs may have the same frame count resulting your flipnote to be faster than what you see.
-
-### Custom button UI
-Some buttons don't briefly change when they are clicked. Some buttons don't even fully press down. It's a bit of an annoyance however this will be fixed later on.
 
 ## Special Thanks
 - cimo95: inspiration of the SIGMAFLIP [(see SignaPic DSi here)](https://gbatemp.net/threads/signapic-dsi-simple-step-to-import-any-jpg-images-into-nintendo-dsi.552288/)
