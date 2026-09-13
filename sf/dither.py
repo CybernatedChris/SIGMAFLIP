@@ -34,8 +34,6 @@ BLUE_NOISE_MATRIX = [_flat_blue_noise[i*64:(i+1)*64] for i in range(64)]
 
 # Thread-safe global cache for threshold matrices
 _THRESH_CACHE = {}
-_DOTDIFF_CACHE = {}
-_RIEMERSMA_CACHE = {}
 
 def get_threshold_matrix(mode):
     if mode in _THRESH_CACHE:
@@ -384,34 +382,29 @@ def apply_dot_diffusion(gray_img, exporting, rapid_rendering):
     """Dot diffusion: processes pixels in a class-matrix order instead of scanline order."""
     width, height = gray_img.size
 
-    key = (width, height)
-    cached = _DOTDIFF_CACHE.get(key)
-    if cached is None:
-        class_matrix = [
-            [35, 49, 41, 53, 37, 51, 43, 55],
-            [63, 15, 59, 11, 61, 13, 57,  9],
-            [31, 47, 39, 51, 33, 45, 37, 49],
-            [59,  7, 55,  3, 61, 11, 57,  7],
-            [34, 48, 40, 52, 36, 50, 42, 54],
-            [62, 14, 58, 10, 60, 12, 56,  8],
-            [30, 46, 38, 50, 32, 44, 36, 48],
-            [58,  6, 54,  2, 60, 10, 56,  6]
-        ]
+    class_matrix = [
+        [35, 49, 41, 53, 37, 51, 43, 55],
+        [63, 15, 59, 11, 61, 13, 57,  9],
+        [31, 47, 39, 51, 33, 45, 37, 49],
+        [59,  7, 55,  3, 61, 11, 57,  7],
+        [34, 48, 40, 52, 36, 50, 42, 54],
+        [62, 14, 58, 10, 60, 12, 56,  8],
+        [30, 46, 38, 50, 32, 44, 36, 48],
+        [58,  6, 54,  2, 60, 10, 56,  6]
+    ]
 
-        order = []
-        for cy in range(0, height, 8):
-            for cx in range(0, width, 8):
-                for by in range(8):
-                    for bx in range(8):
-                        y, x = cy + by, cx + bx
-                        if y < height and x < width:
-                            order.append((class_matrix[by][bx], y, x))
-        order.sort(key=lambda t: t[0])
+    order = []
+    for cy in range(0, height, 8):
+        for cx in range(0, width, 8):
+            for by in range(8):
+                for bx in range(8):
+                    y, x = cy + by, cx + bx
+                    if y < height and x < width:
+                        order.append((class_matrix[by][bx], y, x))
+    order.sort(key=lambda t: t[0])
 
-        cached = (np.array([t[1] for t in order], dtype=np.int64),
-                  np.array([t[2] for t in order], dtype=np.int64))
-        _DOTDIFF_CACHE[key] = cached
-    order_y, order_x = cached
+    order_y = np.array([t[1] for t in order], dtype=np.int64)
+    order_x = np.array([t[2] for t in order], dtype=np.int64)
 
     buf = np.array(gray_img, dtype=np.float32)
     _dot_diffusion_inner(buf, order_y, order_x, height, width)
@@ -422,26 +415,20 @@ def apply_riemersma(gray_img, exporting, rapid_rendering):
     """Riemersma dithering: error diffusion along a serpentine path."""
     width, height = gray_img.size
 
-    key = (width, height)
-    cached = _RIEMERSMA_CACHE.get(key)
-    if cached is None:
-        path_x = np.empty(width * height, dtype=np.int64)
-        path_y = np.empty(width * height, dtype=np.int64)
-        idx = 0
-        for y in range(height):
-            if y % 2 == 0:
-                for x in range(width):
-                    path_x[idx] = x
-                    path_y[idx] = y
-                    idx += 1
-            else:
-                for x in range(width - 1, -1, -1):
-                    path_x[idx] = x
-                    path_y[idx] = y
-                    idx += 1
-        cached = (path_x, path_y)
-        _RIEMERSMA_CACHE[key] = cached
-    path_x, path_y = cached
+    path_x = np.empty(width * height, dtype=np.int64)
+    path_y = np.empty(width * height, dtype=np.int64)
+    idx = 0
+    for y in range(height):
+        if y % 2 == 0:
+            for x in range(width):
+                path_x[idx] = x
+                path_y[idx] = y
+                idx += 1
+        else:
+            for x in range(width - 1, -1, -1):
+                path_x[idx] = x
+                path_y[idx] = y
+                idx += 1
 
     buf = np.array(gray_img, dtype=np.float32)
     _riemersma_inner(buf, path_x, path_y, height, width)
