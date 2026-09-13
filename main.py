@@ -14,6 +14,8 @@ if platform.system() == "Windows":
 from sf.app import SIGMAFLIP
 
 def main():
+    from multiprocessing import freeze_support
+    freeze_support()
     root = ctk.CTk()
     app = SIGMAFLIP(root)
     root.mainloop()
