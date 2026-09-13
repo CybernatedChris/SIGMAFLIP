@@ -20,8 +20,7 @@ from PIL import Image, ImageTk, ImageEnhance
 
 from sf.config import (
     IS_WINDOWS, IS_MAC, IS_LINUX, MAIN_COLOR, SUB_COLOR,
-    MAX_FRAMES, SPEED_FPS, VERSION, get_resource_path, get_icon_path,
-    load_custom_font, WARNING_DURATION, draw_grid_on_canvas
+    MAX_FRAMES, SPEED_FPS, load_custom_font, WARNING_DURATION, draw_grid_on_canvas
 )
 from sf.about import show_about_dialog
 from sf.dither import (apply_ordered_dither, apply_error_diffusion,
@@ -45,11 +44,376 @@ VIDEO_EXTS = (".mp4", ".avi", ".mov", ".mkv", ".gif")
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+DSI_JPEG_KEY = bytes.fromhex("70885206DFE5016D45EAC52333D6446F")
+
+
+def _gf_mul2_mod(block: bytes) -> bytes:
+    x = int.from_bytes(block, 'little')
+    y = (x << 1) & ((1 << 128) - 1)
+    if x >> 127:
+        y ^= 0x87
+    return y.to_bytes(16, 'little')
+
+
+def _dsi_ccm_tag_mod(data: bytes, nonce: bytes) -> bytes:
+    key = DSI_JPEG_KEY
+    rev_key = key[::-1]
+    ecb = AES.new(rev_key, AES.MODE_ECB)
+
+    size = len(data)
+    total_size = (size + 15) & ~15
+    buf = bytearray(data)
+    buf.extend(b'\x00' * (total_size - size))
+    buf[0x18A:0x1A6] = b'\x00' * 0x1C
+
+    block = ecb.encrypt(b'\x00' * 16)[::-1]
+    block = _gf_mul2_mod(block)
+    final_bytes = ((size - 1) & 0xF) + 1
+    if final_bytes == 0x10:
+        block = bytes(a ^ b for a, b in zip(block, bytes(buf[size - 16:size])))
+    else:
+        tmp = bytearray(16)
+        tmp[16 - final_bytes:] = buf[size - final_bytes:size]
+        tmp[15 - final_bytes] = 0x80
+        block = bytes(a ^ b for a, b in zip(_gf_mul2_mod(block), bytes(tmp)))
+    buf[size - final_bytes:size - final_bytes + 16] = block
+
+    b0 = bytes([0x7A]) + nonce[::-1] + b'\x00\x00\x00'
+    mac_state = ecb.encrypt(b0)
+    for off in range(0, total_size, 16):
+        blk = bytes(buf[off:off + 16])[::-1]
+        mac_state = ecb.encrypt(bytes(a ^ b for a, b in zip(blk, mac_state)))
+
+    ctr = bytes([2]) + nonce[::-1] + b'\x00\x00\x00'
+    s0 = ecb.encrypt(ctr)[::-1]
+    return bytes(a ^ b for a, b in zip(mac_state[::-1], s0))
+
+
+def sign_jpeg_dsi_mod(data: bytes) -> bytes:
+    nonce = get_random_bytes(12)
+    tag = _dsi_ccm_tag_mod(data, nonce)
+    out = bytearray(data)
+    out[0x18A:0x18A + 12] = nonce
+    out[0x196:0x196 + 16] = tag
+    return bytes(out)
+
+
+def verify_dsi_signature_mod(data: bytes) -> bool:
+    try:
+        if len(data) < 0x1A6:
+            return False
+        nonce = bytes(data[0x18A:0x18A + 12])
+        tag_stored = bytes(data[0x196:0x196 + 16])
+        return _dsi_ccm_tag_mod(data, nonce) == tag_stored
+    except Exception:
+        return False
+
+
+def verify_jpeg_structure_mod(data: bytes) -> bool:
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            img.verify()
+        return True
+    except Exception:
+        return False
+
+
+def build_dsi_exif_mod(time_str: str, thumb_jpeg: bytes) -> bytes:
+    def be16(v):
+        return struct.pack(">H", v)
+    def be32(v):
+        return struct.pack(">I", v)
+
+    ifd0 = bytearray(2 + 9 * 12 + 4)
+    ifd0[0:2] = be16(9)
+    entries0 = [
+        (0x010F, 2, 9, 0x7A), (0x0110, 2, 11, 0x84), (0x011A, 5, 1, 0x90),
+        (0x011B, 5, 1, 0x98), (0x0128, 3, 1, 0x00020000), (0x0131, 2, 5, 0xA0),
+        (0x0132, 2, 20, 0xA6), (0x0213, 3, 1, 0x00020000), (0x8769, 4, 1, 0xBA),
+    ]
+    for i, (t, ty, c, v) in enumerate(entries0):
+        struct.pack_into(">HHII", ifd0, 2 + i * 12, t, ty, c, v)
+    ifd0[2 + 9 * 12:2 + 9 * 12 + 4] = be32(0x1DE)
+
+    sub = bytearray(2 + 10 * 12 + 4)
+    sub[0:2] = be16(10)
+    entries_sub = [
+        (0x9000, 7, 4, 0x30323230), (0x9003, 2, 20, 0x138), (0x9004, 2, 20, 0x14C),
+        (0x9101, 7, 4, 0x01020300), (0x927C, 7, 66, 0x160), (0xA000, 7, 4, 0x30303130),
+        (0xA001, 3, 1, 0x00010000), (0xA002, 4, 1, 0x280), (0xA003, 4, 1, 0x1E0),
+        (0xA005, 4, 1, 0x1A2),
+    ]
+    for i, (t, ty, c, v) in enumerate(entries_sub):
+        struct.pack_into(">HHII", sub, 2 + i * 12, t, ty, c, v)
+    sub[2 + 10 * 12:2 + 10 * 12 + 4] = be32(0)
+
+    mn = bytearray(2 + 2 * 12 + 4)
+    mn[0:2] = be16(2)
+    entries_mn = [(0x1000, 7, 0x1C, 0x17E), (0x1001, 7, 8, 0x19A)]
+    for i, (t, ty, c, v) in enumerate(entries_mn):
+        struct.pack_into(">HHII", mn, 2 + i * 12, t, ty, c, v)
+    mn[2 + 2 * 12:2 + 2 * 12 + 4] = be32(0)
+
+    interop = bytearray(2 + 3 * 12 + 4)
+    interop[0:2] = be16(3)
+    entries_int = [
+        (0x0001, 2, 4, 0x52393800), (0x0002, 7, 4, 0x30313030), (0x1000, 2, 18, 0x1CC),
+    ]
+    for i, (t, ty, c, v) in enumerate(entries_int):
+        struct.pack_into(">HHII", interop, 2 + i * 12, t, ty, c, v)
+    interop[2 + 3 * 12:2 + 3 * 12 + 4] = be32(0)
+
+    ifd1 = bytearray(2 + 6 * 12 + 4)
+    ifd1[0:2] = be16(6)
+    entries_ifd1 = [
+        (0x0103, 3, 1, 0x00060000), (0x011A, 5, 1, 0x22C), (0x011B, 5, 1, 0x234),
+        (0x0128, 3, 1, 0x00020000), (0x0201, 4, 1, 0x23C), (0x0202, 4, 1, len(thumb_jpeg)),
+    ]
+    for i, (t, ty, c, v) in enumerate(entries_ifd1):
+        struct.pack_into(">HHII", ifd1, 2 + i * 12, t, ty, c, v)
+    ifd1[2 + 6 * 12:2 + 6 * 12 + 4] = be32(0)
+
+    dt = time_str.encode() + b'\x00'
+    tiff = (
+        b"MM\x00\x2A" + be32(8) +
+        bytes(ifd0) +
+        b"Nintendo\x00\x00" + b"NintendoDS\x00\x00" +
+        be32(72) + be32(1) + be32(72) + be32(1) +
+        b"EINH\x00\x00" + dt +
+        bytes(sub) + dt + dt +
+        bytes(mn) +
+        b'\x00' * 0x1C + b'\x00' * 8 +
+        bytes(interop) + b"JPEG Exif Ver 2.2\x00" +
+        bytes(ifd1) +
+        be32(72) + be32(1) + be32(72) + be32(1) +
+        thumb_jpeg
+    )
+    assert len(tiff) == 0x23C + len(thumb_jpeg)
+    payload = b"Exif\x00\x00" + tiff
+    return be16(len(payload) + 2) + payload
+
+
+def encode_sign_frame_mod(pil_img: Image.Image, time_str: str, target_path: str) -> bool:
+    quality = 95
+    MAX_FILE_SIZE = 140000
+    img_data = None
+
+    for attempt in range(6):
+        img_copy = pil_img.copy()
+        img_copy.info.clear()
+
+        try:
+            thumb_buf = io.BytesIO()
+            img_copy.resize((160, 120), Image.LANCZOS).convert("RGB").save(
+                thumb_buf, format="JPEG", quality=75, subsampling=2)
+            main_buf = io.BytesIO()
+            img_copy.convert("RGB").save(
+                main_buf, format="JPEG", quality=quality, subsampling=0)
+            mdata = main_buf.getvalue()
+            body = mdata[2:]
+            app1 = b"\xFF\xE1" + build_dsi_exif_mod(time_str, thumb_buf.getvalue())
+            img_data = b"\xFF\xD8" + app1 + body
+        except Exception:
+            quality -= 5
+            continue
+
+        signed_data = sign_jpeg_dsi_mod(img_data)
+
+        size_ok = len(signed_data) <= MAX_FILE_SIZE
+        sig_ok = verify_dsi_signature_mod(signed_data)
+        struct_ok = verify_jpeg_structure_mod(signed_data)
+
+        if sig_ok and struct_ok and size_ok:
+            with open(target_path, "wb") as f:
+                f.write(signed_data)
+            return True
+
+        if not size_ok:
+            quality -= 8
+        else:
+            quality -= 3
+
+    if img_data is None:
+        return False
+    signed_data = sign_jpeg_dsi_mod(img_data)
+    with open(target_path, "wb") as f:
+        f.write(signed_data)
+    return False
+
+
+_BG_SRC_CACHE = {}
+
+
+def _load_custom_background_mod(path, size, resample):
+    if not path or not os.path.isfile(path):
+        return Image.new("RGB", size, "black")
+    try:
+        cached = _BG_SRC_CACHE.get(path)
+        if cached is None:
+            with Image.open(path) as src:
+                src.load()
+                src = src.convert("RGB")
+                src.thumbnail((640, 480), Image.Resampling.LANCZOS)
+            cached = src
+            _BG_SRC_CACHE[path] = cached
+        return cached.resize(size, resample)
+    except Exception:
+        return Image.new("RGB", size, "black")
+
+
+def _apply_advanced_filters_mod(img, advanced_settings, exporting, playing):
+    img = img.convert("RGBA")
+    alpha = img.getchannel("A")
+    rgb_img = img.convert("RGB")
+
+    contrast_val = advanced_settings.get("contrast", 1.0)
+    perf_skip = advanced_settings.get("performance_mode", False) and playing
+    if contrast_val != 1.0 and not perf_skip:
+        enhancer = ImageEnhance.Contrast(rgb_img)
+        rgb_img = enhancer.enhance(contrast_val)
+
+    if advanced_settings.get("black_and_white", False):
+        gray_img = rgb_img.convert("L")
+        dither = advanced_settings.get("dither_mode", "None")
+
+        if dither == "Floyd-Steinberg":
+            dither_algo = getattr(Image, "Dither", None)
+            if dither_algo and hasattr(dither_algo, "FLOYDSTEINBERG"):
+                algo = dither_algo.FLOYDSTEINBERG
+            else:
+                algo = getattr(Image, "FLOYDSTEINBERG", 3)
+            bw_img = gray_img.convert("1", dither=algo)
+        elif dither in ("Bayer 2x2", "Bayer 3x3", "Bayer 4x4", "Bayer 8x8",
+                        "Bayer 16x16", "Bayer 32x32", "Blue Noise 64x64",
+                        "Halftone", "Flipnote Memory Saver (Experimental)"):
+            bw_img = apply_ordered_dither(gray_img, dither)
+        elif dither in ("Atkinson", "Jarvis-Judice-Ninke",
+                        "Sierra 3-Row", "Sierra Lite",
+                        "Stevenson-Arce"):
+            bw_img = apply_error_diffusion(gray_img, dither, exporting, False)
+        elif dither == "Dot Diffusion":
+            bw_img = apply_dot_diffusion(gray_img, exporting, False)
+        elif dither == "Riemersma":
+            bw_img = apply_riemersma(gray_img, exporting, False)
+        elif dither == "Woodcut":
+            bw_img = apply_woodcut(gray_img, exporting, False)
+        else:
+            bw_img = gray_img.point(lambda x: 255 if x > 127 else 0, mode="1")
+
+        if advanced_settings.get("invert_bw", False):
+            bw_img = bw_img.convert("L").point(lambda x: 255 - x)
+        rgb_img = bw_img.convert("RGB")
+
+    rgb_img.putalpha(alpha)
+    return rgb_img
+
+
+def _apply_scaling_filter_mod(img, target_w, target_h, bg_type, scale_mode, grid_dims,
+                              advanced_settings, bg_image_path, exporting, playing):
+    orig_w, orig_h = img.size
+    pixel_precision = advanced_settings.get("pixel_precision", False)
+    perf_mode = advanced_settings.get("performance_mode", False) and playing
+
+    if not pixel_precision and not exporting:
+        if perf_mode:
+            render_w, render_h = 160, 120
+        else:
+            render_w, render_h = 320, 240
+    else:
+        render_w, render_h = target_w, target_h
+
+    if advanced_settings.get("performance_mode", False):
+        scale_resample = Image.Resampling.BILINEAR
+    elif perf_mode:
+        scale_resample = Image.Resampling.NEAREST
+    else:
+        scale_resample = Image.Resampling.LANCZOS
+
+    if bg_type == "white":
+        bg = Image.new("RGB", (render_w, render_h), "white")
+    elif bg_type == "custom":
+        bg = _load_custom_background_mod(bg_image_path, (render_w, render_h), scale_resample)
+    else:
+        bg = Image.new("RGB", (render_w, render_h), "black")
+
+    img_rgba = img.convert("RGBA")
+    cols, rows = grid_dims
+
+    if scale_mode in ("Tiles", "Tiles Stretched"):
+        tile_w = render_w // cols
+        tile_h = render_h // rows
+
+        if scale_mode == "Tiles Stretched":
+            img_copy = img_rgba.resize((tile_w, tile_h), scale_resample)
+            for r in range(rows):
+                for col in range(cols):
+                    x_offset = col * tile_w
+                    y_offset = r * tile_h
+                    bg.paste(img_copy, (x_offset, y_offset), mask=img_copy)
+        else:
+            scale = min(tile_w / orig_w, tile_h / orig_h)
+            new_w = max(1, min(tile_w, int(round(orig_w * scale))))
+            new_h = max(1, min(tile_h, int(round(orig_h * scale))))
+            img_copy = img_rgba.resize((new_w, new_h), scale_resample)
+            for r in range(rows):
+                for col in range(cols):
+                    x_offset = col * tile_w + (tile_w - new_w) // 2
+                    y_offset = r * tile_h + (tile_h - new_h) // 2
+                    bg.paste(img_copy, (x_offset, y_offset), mask=img_copy)
+        bg_final = bg
+    elif scale_mode == "Fit":
+        scale = min(render_w / orig_w, render_h / orig_h)
+        new_w = max(1, min(render_w, int(round(orig_w * scale))))
+        new_h = max(1, min(render_h, int(round(orig_h * scale))))
+        img_copy = img_rgba.resize((new_w, new_h), scale_resample)
+        bg.paste(img_copy, ((render_w - new_w) // 2, (render_h - new_h) // 2), mask=img_copy)
+        bg_final = bg
+    elif scale_mode == "Stretch":
+        img_copy = img_rgba.resize((render_w, render_h), scale_resample)
+        bg.paste(img_copy, (0, 0), mask=img_copy)
+        bg_final = bg
+    else:
+        scale = max(render_w / orig_w, render_h / orig_h)
+        new_w = int(orig_w * scale)
+        new_h = int(orig_h * scale)
+        img_scaled = img_rgba.resize((new_w, new_h), scale_resample)
+        left = (new_w - render_w) // 2
+        top = (new_h - render_h) // 2
+        img_cropped = img_scaled.crop((left, top, left + render_w, top + render_h))
+        bg.paste(img_cropped, (0, 0), mask=img_cropped)
+        bg_final = bg
+
+    filtered = _apply_advanced_filters_mod(bg_final, advanced_settings, exporting, playing)
+
+    if render_w != target_w or render_h != target_h:
+        filtered = filtered.resize((target_w, target_h), scale_resample)
+
+    return filtered
+
+
+def _process_and_sign_job(job):
+    src_path, dst_path, time_str, params = job
+    try:
+        with Image.open(src_path) as raw:
+            src_img = raw.convert("RGBA")
+        processed = _apply_scaling_filter_mod(
+            src_img, 640, 480,
+            params["bg_type"], params["scale_mode"], params["grid_dims"],
+            params["advanced_settings"], params["bg_image_path"],
+            True, False,
+        )
+        processed.info.clear()
+        return encode_sign_frame_mod(processed, time_str, dst_path)
+    except Exception as e:
+        print(f"[SIGMAFLIP] Frame processing failed for {os.path.basename(src_path)}: {e}")
+        return False
+
+
 class SIGMAFLIP:
     def __init__(self, root):
         self.root = root
         self.root.title("SIGMAFLIP")
-        self.root.geometry("500x580")  # Re-centered default layout height
+        self.root.geometry("500x620")  # Re-centered default layout height
         self.root.resizable(False, False)
         
         self._theme_bg = ("#f3f4f6", "#151515")
@@ -146,6 +510,8 @@ class SIGMAFLIP:
         self.current_singular_view = "preview"  # "preview" or "grid"
         self._thumbnail_tk_images = []
         self._tooltip_win = None
+        self._rearrange_mode = False
+        self._rearrange_grab = False
 
         config_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.config_filepath = os.path.join(config_dir, ".sigmaflip_config.json")
@@ -270,6 +636,12 @@ class SIGMAFLIP:
     def play_sound(self, filename):
         if filename in self.sfx_cache:
             try:
+                now = time.perf_counter()
+                throttle = getattr(self, "_sound_throttle", {})
+                if now - throttle.get(filename, 0.0) < 0.15:
+                    return
+                throttle[filename] = now
+                self._sound_throttle = throttle
                 ch = pygame.mixer.find_channel()
                 if ch:
                     ch.play(self.sfx_cache[filename])
@@ -287,7 +659,7 @@ class SIGMAFLIP:
             ('next', 'nextframe.png'), ('next_down', 'nextframe_down.png'), ('next_disabled', 'nextframe_disabled.png'),
             ('beg', 'beg.png'), ('beg_down', 'beg_down.png'), ('beg_disabled', 'beg_disabled.png'),
             ('end', 'end.png'), ('end_down', 'end_down.png'), ('end_disabled', 'end_disabled.png'),
-            ('lock', 'lock.png'), ('lock_down', 'lock_down.png'), ('unlock', 'unlock.png'), ('unlock_down', 'unlock_down.png')
+            ('lock', 'lock.png'), ('lock_down', 'lock_down.png'), ('lock_disabled', 'lock_disabled.png'), ('unlock', 'unlock.png'), ('unlock_down', 'unlock_down.png'), ('unlock_disabled', 'unlock_disabled.png')
         ]:
             p = os.path.join(self.img_path, fname)
             if os.path.exists(p):
@@ -300,6 +672,7 @@ class SIGMAFLIP:
                 self.icons[k] = None
 
     def add_press_feedback(self, btn):
+        """Flashes matching _down variant for ~120ms, then runs the button's command."""
         orig_command = btn.cget("command")
 
         def flash_click(*args):
@@ -415,6 +788,7 @@ class SIGMAFLIP:
             command=self.show_advanced_settings
         )
         
+        self.menubar.add_command(label="Keyboard Shortcuts", command=self.show_keybinds)
         self.menubar.add_command(label="About", command=self.show_about_dialog)
 
     def toggle_audio_menu_item(self):
@@ -501,34 +875,7 @@ class SIGMAFLIP:
             return False, str(e)
 
     def _clear_background_cache(self):
-        cached = getattr(self, "_cached_bg_src", None)
-        if cached is not None:
-            try:
-                cached.close()
-            except Exception:
-                pass
-        self._cached_bg_src = None
-        self._cached_bg_path = None
-
-    def _get_custom_background(self, size, resample):
-        path = self.bg_image_path
-        if not path or not os.path.isfile(path):
-            return Image.new("RGB", size, "black")
-
-        try:
-            if getattr(self, "_cached_bg_path", None) != path or getattr(self, "_cached_bg_src", None) is None:
-                self._clear_background_cache()
-                with Image.open(path) as src:
-                    src.load()
-                    cached = src.convert("RGB")
-                    cached.thumbnail((640, 480), Image.Resampling.LANCZOS)
-                    self._cached_bg_src = cached.copy()
-                self._cached_bg_path = path
-            return self._cached_bg_src.resize(size, resample)
-        except Exception as e:
-            print(f"Error loading Custom Background Fill: {e}")
-            self._clear_background_cache()
-            return Image.new("RGB", size, "black")
+        _BG_SRC_CACHE.clear()
 
     def select_custom_bg_image(self):
         file_path = filedialog.askopenfilename(
@@ -653,6 +1000,7 @@ class SIGMAFLIP:
         self.bg_canvas = tk.Canvas(self.root, bg="#1a1a1a", highlightthickness=0, bd=0)
         self.bg_canvas.place(x=0, y=0, relwidth=1, relheight=1)
         self.root.bind("<Configure>", self.draw_window_grid)
+        self.root.bind_all("<Key>", self.on_global_key)
 
         top_frame = ctk.CTkFrame(self.root, fg_color="transparent")
         top_frame.pack(fill="x", pady=5)
@@ -983,6 +1331,9 @@ class SIGMAFLIP:
         self.set_flipnote_speed(clicked_speed)
 
     def set_flipnote_speed(self, speed_idx):
+        speed_idx = max(1, min(speed_idx, 8))
+        if speed_idx == self.speed:
+            return
         self.speed = speed_idx
         self.sync_speed_widget_image()
         self.play_sound(f'speed{self.speed}.mp3')
@@ -1006,6 +1357,7 @@ class SIGMAFLIP:
         self.repack_singular_image_layout()
 
     def switch_to_preview_view(self):
+        self.exit_rearrange_mode()
         self.current_singular_view = "preview"
         self.toggle_view_btn.configure(text="Switch to Grid View")
         self._stop_thumb_scroll()
@@ -1191,6 +1543,11 @@ class SIGMAFLIP:
                     child.configure(bg=bg)
                 except Exception:
                     pass
+
+        if getattr(self, "_rearrange_grab", False):
+            grabbed = self._thumb_cells.get(self.still_index)
+            if grabbed:
+                grabbed.configure(highlightbackground="#f5c518", highlightthickness=3)
 
     def _swap_thumb_cells(self, idx1, idx2):
         if idx1 not in self._thumb_cells or idx2 not in self._thumb_cells:
@@ -1387,7 +1744,7 @@ class SIGMAFLIP:
 
     def on_export_mode_change(self, value):
         self.play_sound('apply.mp3')
-        
+
         if self.cap:
             self.cap.release()
             self.cap = None
@@ -1421,6 +1778,11 @@ class SIGMAFLIP:
                 text_color=SUB_COLOR
             )
             self.export_btn.configure(text="Export Frames")
+
+    def toggle_export_mode(self):
+        new_mode = "Singular Image" if self.export_mode_var.get() != "Singular Image" else "Video Frames"
+        self.export_mode_var.set(new_mode)
+        self.on_export_mode_change(new_mode)
 
     def load_video_dialog(self):
         if self.playing:
@@ -1815,17 +2177,7 @@ class SIGMAFLIP:
             try:
                 pil_img = Image.open(self.video_path).convert("RGBA")
                 pil_img = self.apply_scaling_to_image(pil_img, canvas_w, canvas_h)
-                if pil_img.mode == "RGBA":
-                    bg_type = self.bg_type_var.get()
-                    if bg_type == "white":
-                        flat = Image.new("RGB", pil_img.size, (255, 255, 255))
-                    elif bg_type == "custom":
-                        flat = self._get_custom_background(pil_img.size, Image.Resampling.NEAREST)
-                    else:
-                        flat = Image.new("RGB", pil_img.size, (0, 0, 0))
-                    flat.paste(pil_img, mask=pil_img.split()[3])
-                    pil_img = flat
-                    self.tk_image = ImageTk.PhotoImage(pil_img)
+                self.tk_image = ImageTk.PhotoImage(pil_img)
                 self.video_canvas.delete("all")
                 self.video_canvas.create_image(canvas_w // 2, canvas_h // 2, image=self.tk_image, anchor="center")
             except Exception as e:
@@ -1849,155 +2201,25 @@ class SIGMAFLIP:
             if not ret:
                 return
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_img = Image.fromarray(frame)
+            pil_img = Image.fromarray(frame).convert("RGBA")
         else:
             return
 
         pil_img = self.apply_scaling_to_image(pil_img, canvas_w, canvas_h)
-
-        if pil_img.mode == "RGBA":
-            bg_type = self.bg_type_var.get()
-            if bg_type == "white":
-                flat = Image.new("RGB", pil_img.size, (255, 255, 255))
-            elif bg_type == "custom":
-                flat = self._get_custom_background(pil_img.size, Image.Resampling.NEAREST)
-            else:
-                flat = Image.new("RGB", pil_img.size, (0, 0, 0))
-            flat.paste(pil_img, mask=pil_img.split()[3])
-            pil_img = flat
 
         self.tk_image = ImageTk.PhotoImage(pil_img)
         self.video_canvas.delete("all")
         self.video_canvas.create_image(canvas_w // 2, canvas_h // 2, image=self.tk_image, anchor="center")
 
     def apply_advanced_filters(self, img):
-        settings = self.advanced_settings
-
-        img = img.convert("RGBA")
-        alpha = img.getchannel("A")
-        rgb_img = img.convert("RGB")
-
-        contrast_val = settings.get("contrast", 1.0)
-        perf_skip = settings.get("performance_mode", False) and self.playing
-        if contrast_val != 1.0 and not perf_skip:
-            enhancer = ImageEnhance.Contrast(rgb_img)
-            rgb_img = enhancer.enhance(contrast_val)
-
-        if settings.get("black_and_white", False):
-            gray_img = rgb_img.convert("L")
-            dither = settings.get("dither_mode", "None")
-
-            if dither == "Floyd-Steinberg":
-                dither_algo = getattr(Image, "Dither", None)
-                if dither_algo and hasattr(dither_algo, "FLOYDSTEINBERG"):
-                    algo = dither_algo.FLOYDSTEINBERG
-                else:
-                    algo = getattr(Image, "FLOYDSTEINBERG", 3)
-                bw_img = gray_img.convert("1", dither=algo)
-            elif dither in ("Bayer 2x2", "Bayer 3x3", "Bayer 4x4", "Bayer 8x8",
-                            "Bayer 16x16", "Bayer 32x32", "Blue Noise 64x64",
-                            "Halftone", "Flipnote Memory Saver (Experimental)"):
-                bw_img = self.apply_ordered_dither(gray_img, dither)
-            elif dither in ("Atkinson", "Jarvis-Judice-Ninke", 
-                            "Sierra 3-Row", "Sierra Lite",
-                            "Stevenson-Arce"):
-                bw_img = self.apply_error_diffusion(gray_img, dither)
-            elif dither == "Dot Diffusion":
-                bw_img = apply_dot_diffusion(gray_img, self._exporting, self._rapid_rendering)
-            elif dither == "Riemersma":
-                bw_img = apply_riemersma(gray_img, self._exporting, self._rapid_rendering)
-            elif dither == "Woodcut":
-                bw_img = apply_woodcut(gray_img, self._exporting, self._rapid_rendering)
-            else:
-                bw_img = gray_img.point(lambda x: 255 if x > 127 else 0, mode="1")
-            
-            if settings.get("invert_bw", False):
-                bw_img = bw_img.convert("L").point(lambda x: 255 - x)
-            rgb_img = bw_img.convert("RGB")
-
-        rgb_img.putalpha(alpha)
-        return rgb_img
-
-    def apply_ordered_dither(self, gray_img, mode):
-        return apply_ordered_dither(gray_img, mode)
-
-    def apply_error_diffusion(self, gray_img, kernel_name):
-        return apply_error_diffusion(gray_img, kernel_name, self._exporting, self._rapid_rendering)
+        return _apply_advanced_filters_mod(img, self.advanced_settings, self._exporting, self.playing)
 
     def apply_scaling_to_image(self, img, target_w, target_h):
-        orig_w, orig_h = img.size
-        bg_type = self.bg_type
-        
-        pixel_precision = self.advanced_settings.get("pixel_precision", False)
-        perf_mode = self.advanced_settings.get("performance_mode", False) and self.playing
-        
-        if not pixel_precision and not self._exporting:
-            if perf_mode:
-                render_w, render_h = 160, 120
-            else:
-                render_w, render_h = 320, 240
-        else:
-            render_w, render_h = target_w, target_h
-        
-        scale_resample = Image.Resampling.NEAREST if perf_mode else Image.Resampling.LANCZOS
-
-        if bg_type == "white":
-            bg = Image.new("RGB", (render_w, render_h), "white")
-        elif bg_type == "custom":
-            bg = self._get_custom_background((render_w, render_h), scale_resample)
-        else:
-            bg = Image.new("RGB", (render_w, render_h), "black")
-            
-        img_rgba = img.convert("RGBA")
-
-        if self.scale_mode in ("Tiles", "Tiles Stretched"):
-            cols, rows = self.get_grid_dimensions()
-            tile_w = render_w // cols
-            tile_h = render_h // rows
-            
-            if self.scale_mode == "Tiles Stretched":
-                img_copy = img_rgba.resize((tile_w, tile_h), scale_resample)
-                for r in range(rows):
-                    for col in range(cols):
-                        x_offset = col * tile_w
-                        y_offset = r * tile_h
-                        bg.paste(img_copy, (x_offset, y_offset), mask=img_copy)
-            else:
-                img_copy = img_rgba.copy()
-                img_copy.thumbnail((tile_w, tile_h), scale_resample)
-                for r in range(rows):
-                    for col in range(cols):
-                        x_offset = col * tile_w + (tile_w - img_copy.width) // 2
-                        y_offset = r * tile_h + (tile_h - img_copy.height) // 2
-                        bg.paste(img_copy, (x_offset, y_offset), mask=img_copy)
-            bg_final = bg
-            
-        elif self.scale_mode == "Fit":
-            img_copy = img_rgba.copy()
-            img_copy.thumbnail((render_w, render_h), scale_resample)
-            bg.paste(img_copy, ((render_w - img_copy.width) // 2, (render_h - img_copy.height) // 2), mask=img_copy)
-            bg_final = bg
-        elif self.scale_mode == "Stretch":
-            img_copy = img_rgba.resize((render_w, render_h), scale_resample)
-            bg.paste(img_copy, (0, 0), mask=img_copy)
-            bg_final = bg
-        else:
-            scale = max(render_w / orig_w, render_h / orig_h)
-            new_w = int(orig_w * scale)
-            new_h = int(orig_h * scale)
-            img_scaled = img_rgba.resize((new_w, new_h), scale_resample)
-            left = (new_w - render_w) // 2
-            top = (new_h - render_h) // 2
-            img_cropped = img_scaled.crop((left, top, left + render_w, top + render_h))
-            bg.paste(img_cropped, (0, 0), mask=img_cropped)
-            bg_final = bg
-
-        filtered = self.apply_advanced_filters(bg_final)
-
-        if render_w != target_w or render_h != target_h:
-            filtered = filtered.resize((target_w, target_h), scale_resample)
-
-        return filtered
+        return _apply_scaling_filter_mod(
+            img, target_w, target_h,
+            self.bg_type, self.scale_mode, self.get_grid_dimensions(),
+            self.advanced_settings, self.bg_image_path,
+            self._exporting, self.playing)
 
     def on_slider_press(self, event=None):
         """User pressed down on the seekbar slider thumb or track."""
@@ -2042,8 +2264,8 @@ class SIGMAFLIP:
         if frame_step > 1:
             frame_idx = int(frame_idx // frame_step) * frame_step
         self.current_frame_idx = frame_idx
+        self.timeline_slider.set(int(frame_idx))
 
-        # Update preview frame immediately under the cursor
         self.update_frame_display()
 
         if not self._is_scrubbing and self.playing:
@@ -2132,205 +2354,293 @@ class SIGMAFLIP:
         delay_ms = max(1, int((next_at - elapsed) * 1000))
         self.after_play_id = self.root.after(delay_ms, self.playback_tick)
 
+    def _seek_seconds(self, delta):
+        if not (self.cap or self.gif_img) or self._is_scrubbing:
+            return
+        sec = max(0.0, self.current_frame_idx / self.video_fps + delta)
+        max_sec = max(0.0, (self.total_video_frames - 1) / self.video_fps)
+        sec = min(sec, max_sec)
+        self.on_slider_scrub(int(sec * self.video_fps))
 
-    DSI_SIG_PADDING = 512
-    DSI_JPEG_KEY = bytes.fromhex("70885206DFE5016D45EAC52333D6446F")
-    DSI_NATIVE_W = 256
-    DSI_NATIVE_H = 192
+    def _jump_video_fraction(self, digit):
+        if not (self.cap or self.gif_img) or self._is_scrubbing:
+            return
+        self.on_slider_scrub(int((self.total_video_frames - 1) * (digit / 9.0)))
 
-    def _gf_mul2(self, block: bytes) -> bytes:
-        x = int.from_bytes(block, 'little')
-        y = (x << 1) & ((1 << 128) - 1)
-        if x >> 127:
-            y ^= 0x87
-        return y.to_bytes(16, 'little')
+    def stop_playback(self):
+        if self.playing:
+            self.toggle_play()
+        if self.cap or self.gif_img:
+            self.current_frame_idx = 0
+            self.timeline_slider.set(0)
+            self.update_frame_display()
 
-    def _dsi_ccm_tag(self, data: bytes, nonce: bytes) -> bytes:
-        key = self.DSI_JPEG_KEY
-        rev_key = key[::-1]
-        ecb = AES.new(rev_key, AES.MODE_ECB)
+    def on_global_key(self, event):
+        if getattr(self, "_exporting", False):
+            return None
+        if event.widget.winfo_class() in ("Entry", "Spinbox", "Text"):
+            return None
+        ks = event.keysym
+        if not ks:
+            return None
+        mods = event.state
+        ctrl = bool(mods & 0x4)
+        shift = bool(mods & 0x1)
+        is_singular = (self.export_mode_var.get() == "Singular Image")
+        have_video = bool(self.cap or self.gif_img)
+        ksl = ks.lower()
 
-        size = len(data)
-        total_size = (size + 15) & ~15
-        buf = bytearray(data)
-        buf.extend(b'\x00' * (total_size - size))
-        buf[0x18A:0x1A6] = b'\x00' * 0x1C
+        if ctrl or (IS_MAC and bool(mods & 0x8)):
+            if ksl == "o":
+                if shift:
+                    self.toggle_export_mode()
+                else:
+                    self.load_video_dialog()
+                return "break"
+            if ksl == "s":
+                self.export_frames()
+                return "break"
+            return None
 
-        block = ecb.encrypt(b'\x00' * 16)[::-1]
-        block = self._gf_mul2(block)
-        final_bytes = ((size - 1) & 0xF) + 1
-        if final_bytes == 0x10:
-            block = bytes(a ^ b for a, b in zip(block, bytes(buf[size - 16:size])))
-        else:
-            tmp = bytearray(16)
-            tmp[16 - final_bytes:] = buf[size - final_bytes:size]
-            tmp[15 - final_bytes] = 0x80
-            block = bytes(a ^ b for a, b in zip(self._gf_mul2(block), bytes(tmp)))
-        buf[size - final_bytes:size - final_bytes + 16] = block
+        if ks == "Up" or ks == "Down":
+            delta = 1 if ks == "Up" else -1
+            self.set_flipnote_speed(max(1, min(8, self.speed + delta)))
+            return "break"
 
-        b0 = bytes([0x7A]) + nonce[::-1] + b'\x00\x00\x00'
-        mac_state = ecb.encrypt(b0)
-        for off in range(0, total_size, 16):
-            blk = bytes(buf[off:off + 16])[::-1]
-            mac_state = ecb.encrypt(bytes(a ^ b for a, b in zip(blk, mac_state)))
+        if ks == "backslash":
+            if self.scale_mode in ("Tiles", "Tiles Stretched"):
+                if time.perf_counter() - getattr(self, "_last_key_times", {}).get("backslash", 0.0) < 0.3:
+                    return "break"
+                self._last_key_times = getattr(self, "_last_key_times", {})
+                self._last_key_times["backslash"] = time.perf_counter()
+                self.toggle_tile_link()
+                return "break"
+            return None
 
-        ctr = bytes([2]) + nonce[::-1] + b'\x00\x00\x00'
-        s0 = ecb.encrypt(ctr)[::-1]
-        return bytes(a ^ b for a, b in zip(mac_state[::-1], s0))
+        if ks == "space":
+            if time.perf_counter() - getattr(self, "_last_key_times", {}).get("space", 0.0) < 0.3:
+                return "break"
+            self._last_key_times = getattr(self, "_last_key_times", {})
+            self._last_key_times["space"] = time.perf_counter()
+            self.toggle_play()
+            return "break"
 
-    def sign_jpeg_dsi(self, data: bytes) -> bytes:
-        nonce = get_random_bytes(12)
-        tag = self._dsi_ccm_tag(data, nonce)
-        out = bytearray(data)
-        out[0x18A:0x18A + 12] = nonce
-        out[0x196:0x196 + 16] = tag
-        return bytes(out)
+        if ks == "Escape":
+            if self._rearrange_mode:
+                self.exit_rearrange_mode()
+                return "break"
+            self.stop_playback()
+            return "break"
 
-    def verify_dsi_signature(self, data: bytes) -> bool:
+        if is_singular:
+            if ks in ("grave", "asciitilde"):
+                self.play_sound('apply.mp3')
+                if self._rearrange_mode:
+                    self.exit_rearrange_mode()
+                    if self.current_singular_view == "grid":
+                        self.switch_to_preview_view()
+                else:
+                    self.start_rearrange_mode()
+                return "break"
+            if self._rearrange_mode:
+                if ks == "Return":
+                    self.play_sound('apply.mp3')
+                    self._rearrange_grab = not self._rearrange_grab
+                    self._update_thumb_selection(None, self.still_index)
+                    return "break"
+                if ks == "Left":
+                    if self._rearrange_grab:
+                        self.move_frame_left()
+                    else:
+                        self.show_prev_image()
+                    return "break"
+                if ks == "Right":
+                    if self._rearrange_grab:
+                        self.move_frame_right()
+                    else:
+                        self.show_next_image()
+                    return "break"
+                return None
+            if shift and ks == "Left":
+                self.jump_to_beginning()
+                return "break"
+            if shift and ks == "Right":
+                self.jump_to_end()
+                return "break"
+            if ks == "Left":
+                self.show_prev_image()
+                return "break"
+            if ks == "Right":
+                self.show_next_image()
+                return "break"
+            return None
+
+        if not have_video:
+            return None
+        if ksl == "k":
+            if time.perf_counter() - getattr(self, "_last_key_times", {}).get("space", 0.0) < 0.3:
+                return "break"
+            self._last_key_times = getattr(self, "_last_key_times", {})
+            self._last_key_times["space"] = time.perf_counter()
+            self.toggle_play()
+            return "break"
+        if ks == "Left":
+            self._seek_seconds(-5)
+            return "break"
+        if ks == "Right":
+            self._seek_seconds(5)
+            return "break"
+        if ksl == "j":
+            self._seek_seconds(-10)
+            return "break"
+        if ksl == "l":
+            self._seek_seconds(10)
+            return "break"
+        if ks in "0123456789":
+            self._jump_video_fraction(int(ks))
+            return "break"
+        return None
+
+    def show_keybinds(self):
+        if getattr(self, "_keybind_win", None) is not None and self._keybind_win.winfo_exists():
+            self._keybind_win.lift()
+            return
+        win = ctk.CTkToplevel(self.root)
+        self._keybind_win = win
+        win.title("Keyboard Shortcuts")
+        win.geometry("560x600")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.configure(fg_color=("#f3f4f6", "#151515"))
         try:
-            if len(data) < 0x1A6:
-                return False
-            nonce = bytes(data[0x18A:0x18A + 12])
-            tag_stored = bytes(data[0x196:0x196 + 16])
-            return self._dsi_ccm_tag(data, nonce) == tag_stored
+            self._set_window_icon(win)
         except Exception:
-            return False
+            pass
 
-    def verify_jpeg_structure(self, data: bytes) -> bool:
-        try:
-            with Image.open(io.BytesIO(data)) as img:
-                img.verify()
-            return True
-        except Exception:
-            return False
+        bg_canvas = tk.Canvas(win, bg="#1a1a1a", highlightthickness=0, bd=0)
+        bg_canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        last_grid = {"w": 0, "h": 0}
 
-    def build_dsi_exif(self, time_str: str, thumb_jpeg: bytes) -> bytes:
-        def be16(v):
-            return struct.pack(">H", v)
-        def be32(v):
-            return struct.pack(">I", v)
+        def draw_bg(event=None):
+            try:
+                if not win.winfo_exists():
+                    return
+                w = win.winfo_width()
+                h = win.winfo_height()
+                if w == last_grid["w"] and h == last_grid["h"]:
+                    return
+                last_grid.update(w=w, h=h)
+                draw_grid_on_canvas(bg_canvas, w, h, ctk.get_appearance_mode().lower())
+            except Exception:
+                pass
 
-        ifd0 = bytearray(2 + 9 * 12 + 4)
-        ifd0[0:2] = be16(9)
-        entries0 = [
-            (0x010F, 2, 9, 0x7A), (0x0110, 2, 11, 0x84), (0x011A, 5, 1, 0x90),
-            (0x011B, 5, 1, 0x98), (0x0128, 3, 1, 0x00020000), (0x0131, 2, 5, 0xA0),
-            (0x0132, 2, 20, 0xA6), (0x0213, 3, 1, 0x00020000), (0x8769, 4, 1, 0xBA),
+        win.bind("<Configure>", draw_bg)
+
+        main = self.main_color_adaptive
+        sub = self.sub_color_adaptive
+        accent = self.highlight_color_adaptive
+
+        frame = ctk.CTkFrame(win, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=24, pady=16)
+
+        ctk.CTkLabel(
+            frame, text="Keyboard Shortcuts", font=self.font_title,
+            text_color=main, fg_color="transparent"
+        ).pack(pady=(0, 6))
+
+        content = ctk.CTkScrollableFrame(frame, fg_color="transparent")
+        content.pack(fill="both", expand=True)
+
+        sections = [
+            ("VIDEO PLAYBACK", [
+                ("↑/↓", "Change Flipnote speed"),
+                ("Space/K", "Play/pause"),
+                ("←/→", "Skip backward/forward 5 seconds"),
+                ("J/L", "Skip backward/forward 10 seconds"),
+                ("0-9", "Jump to that point of the video"),
+                ("Escape", "Stop playback"),
+                ("Ctrl+O/⌘+O", "Load photos/video"),
+                ("Ctrl+S/⌘+S", "Export frames"),
+            ]),
+            ("SINGULAR IMAGE MODE", [
+                ("←/→", "Previous/next image"),
+                ("Shift+←/Shift+→", "Jump to first/last image"),
+                ("`", "Rearrange images in grid view (Enter to select, Left/Right to move)"),
+            ]),
+            ("OTHER", [
+                ("Ctrl+Shift+O/⌘+Shift+O", "Switch between Video Frames and Singular Image mode"),
+                ("\\", "Toggle tile linking"),
+            ]),
         ]
-        for i, (t, ty, c, v) in enumerate(entries0):
-            struct.pack_into(">HHII", ifd0, 2 + i * 12, t, ty, c, v)
-        ifd0[2 + 9 * 12:2 + 9 * 12 + 4] = be32(0x1DE)
+        for title, items in sections:
+            ctk.CTkLabel(
+                content, text=title, font=self.font_small,
+                text_color=accent, fg_color="transparent"
+            ).pack(pady=(12, 4))
+            for key, desc in items:
+                row = ctk.CTkFrame(content, fg_color="transparent")
+                row.pack(fill="x", pady=2)
+                row.columnconfigure(1, weight=1)
+                ctk.CTkLabel(
+                    row, text=key, font=self.font_medium_bold,
+                    width=200, anchor="w", text_color=main, fg_color="transparent"
+                ).grid(row=0, column=0, sticky="w")
+                ctk.CTkLabel(
+                    row, text=desc, font=self.font_tiny,
+                    anchor="w", justify="left", wraplength=270,
+                    text_color=sub, fg_color="transparent"
+                ).grid(row=0, column=1, sticky="w", padx=(8, 0))
 
-        sub = bytearray(2 + 10 * 12 + 4)
-        sub[0:2] = be16(10)
-        entries_sub = [
-            (0x9000, 7, 4, 0x30323230), (0x9003, 2, 20, 0x138), (0x9004, 2, 20, 0x14C),
-            (0x9101, 7, 4, 0x01020300), (0x927C, 7, 66, 0x160), (0xA000, 7, 4, 0x30313030),
-            (0xA001, 3, 1, 0x00010000), (0xA002, 4, 1, 0x280), (0xA003, 4, 1, 0x1E0),
-            (0xA005, 4, 1, 0x1A2),
-        ]
-        for i, (t, ty, c, v) in enumerate(entries_sub):
-            struct.pack_into(">HHII", sub, 2 + i * 12, t, ty, c, v)
-        sub[2 + 10 * 12:2 + 10 * 12 + 4] = be32(0)
+        def close():
+            win.destroy()
+            self._keybind_win = None
 
-        mn = bytearray(2 + 2 * 12 + 4)
-        mn[0:2] = be16(2)
-        entries_mn = [(0x1000, 7, 0x1C, 0x17E), (0x1001, 7, 8, 0x19A)]
-        for i, (t, ty, c, v) in enumerate(entries_mn):
-            struct.pack_into(">HHII", mn, 2 + i * 12, t, ty, c, v)
-        mn[2 + 2 * 12:2 + 2 * 12 + 4] = be32(0)
+        win.protocol("WM_DELETE_WINDOW", close)
 
-        interop = bytearray(2 + 3 * 12 + 4)
-        interop[0:2] = be16(3)
-        entries_int = [
-            (0x0001, 2, 4, 0x52393800), (0x0002, 7, 4, 0x30313030), (0x1000, 2, 18, 0x1CC),
-        ]
-        for i, (t, ty, c, v) in enumerate(entries_int):
-            struct.pack_into(">HHII", interop, 2 + i * 12, t, ty, c, v)
-        interop[2 + 3 * 12:2 + 3 * 12 + 4] = be32(0)
+    def start_rearrange_mode(self):
+        if self.export_mode_var.get() != "Singular Image" or not self.image_paths:
+            return
+        if self.current_singular_view != "grid":
+            self.switch_to_grid_view()
+        if self._rearrange_grab:
+            return
+        self._rearrange_mode = True
+        self._update_thumb_selection(None, self.still_index)
 
-        ifd1 = bytearray(2 + 6 * 12 + 4)
-        ifd1[0:2] = be16(6)
-        entries_ifd1 = [
-            (0x0103, 3, 1, 0x00060000), (0x011A, 5, 1, 0x22C), (0x011B, 5, 1, 0x234),
-            (0x0128, 3, 1, 0x00020000), (0x0201, 4, 1, 0x23C), (0x0202, 4, 1, len(thumb_jpeg)),
-        ]
-        for i, (t, ty, c, v) in enumerate(entries_ifd1):
-            struct.pack_into(">HHII", ifd1, 2 + i * 12, t, ty, c, v)
-        ifd1[2 + 6 * 12:2 + 6 * 12 + 4] = be32(0)
-
-        dt = time_str.encode() + b'\x00'
-        tiff = (
-            b"MM\x00\x2A" + be32(8) +
-            bytes(ifd0) +
-            b"Nintendo\x00\x00" + b"NintendoDS\x00\x00" +
-            be32(72) + be32(1) + be32(72) + be32(1) +
-            b"EINH\x00\x00" + dt +
-            bytes(sub) + dt + dt +
-            bytes(mn) +
-            b'\x00' * 0x1C + b'\x00' * 8 +
-            bytes(interop) + b"JPEG Exif Ver 2.2\x00" +
-            bytes(ifd1) +
-            be32(72) + be32(1) + be32(72) + be32(1) +
-            thumb_jpeg
-        )
-        assert len(tiff) == 0x23C + len(thumb_jpeg)
-        payload = b"Exif\x00\x00" + tiff
-        return be16(len(payload) + 2) + payload
+    def exit_rearrange_mode(self):
+        if not self._rearrange_mode:
+            return
+        self._rearrange_mode = False
+        self._rearrange_grab = False
+        self._update_thumb_selection(None, self.still_index)
 
     def encode_and_sign_frame_safe(self, pil_img: Image.Image, time_str: str, target_path: str) -> bool:
-        quality = 95
-        MAX_FILE_SIZE = 140000
+        return encode_sign_frame_mod(pil_img, time_str, target_path)
 
-        for attempt in range(6):
-            img_copy = pil_img.copy()
-            img_copy.info.clear()
+    def get_export_worker_count(self) -> int:
+        total_cores = os.cpu_count() or 1
+        if self.advanced_settings.get("performance_mode", False):
+            return max(1, min(total_cores - 1, 2))
+        return max(1, total_cores)
 
+    def set_export_priority(self, low_end_mode: bool):
+        if IS_WINDOWS:
             try:
-                thumb_buf = io.BytesIO()
-                img_copy.resize((160, 120), Image.LANCZOS).convert("RGB").save(
-                    thumb_buf, format="JPEG", quality=75, subsampling=2)
-                main_buf = io.BytesIO()
-                img_copy.convert("RGB").save(
-                    main_buf, format="JPEG", quality=quality, subsampling=0)
-                mdata = main_buf.getvalue()
-                body = mdata[2:]
-                app1 = b"\xFF\xE1" + self.build_dsi_exif(time_str, thumb_buf.getvalue())
-                img_data = b"\xFF\xD8" + app1 + body
+                import ctypes
+                handle = ctypes.windll.kernel32.GetCurrentProcess()
+                priority = 0x00004000 if low_end_mode else 0x00000020
+                ctypes.windll.kernel32.SetPriorityClass(handle, priority)
             except Exception:
-                quality -= 5
-                continue
+                pass
 
-            signed_data = self.sign_jpeg_dsi(img_data)
-
-            size_ok = len(signed_data) <= MAX_FILE_SIZE
-            sig_ok = self.verify_dsi_signature(signed_data)
-            struct_ok = self.verify_jpeg_structure(signed_data)
-
-            if sig_ok and struct_ok and size_ok:
-                with open(target_path, "wb") as f:
-                    f.write(signed_data)
-                return True
-
-            if not size_ok:
-                quality -= 8
-            else:
-                quality -= 3
-
-        signed_data = self.sign_jpeg_dsi(img_data)
-        with open(target_path, "wb") as f:
-            f.write(signed_data)
-        return False
-
-    def _sign_and_partition(self, output_dir: str, sources: list[str], base_time: float, remove_sources: bool = False) -> tuple[int, int]:
+    def _sign_and_partition(self, output_dir: str, sources: list[str], base_time: float, remove_sources: bool = False, progress_range: tuple = (0.0, 1.0)) -> tuple[int, int]:
         batch_size = max(1, int(self.advanced_settings.get("album_capacity", 100)))
         dsi_suffix = "NIN02" if self.console_type == "dsi" else "NIN01"
         use_parts = (self.export_structure == "parts")
 
         total = len(sources)
-        signed_count = 0
-        folder_sets = 0
-        frame_index = 0
+        p_start, p_end = progress_range
+        p_span = p_end - p_start
 
         if use_parts:
             batches = [("", sources)]
@@ -2340,6 +2650,8 @@ class SIGMAFLIP:
                 label = "DCIM" if i == 0 else f"DCIM_{i // batch_size + 1}"
                 batches.append((label, sources[i:i + batch_size]))
 
+        jobs = []
+        folder_sets = 0
         for batch_label, batch in batches:
             for part_idx, chunk in enumerate([batch[i:i + 100] for i in range(0, len(batch), 100)]):
                 if use_parts:
@@ -2349,23 +2661,71 @@ class SIGMAFLIP:
                 os.makedirs(part_dir, exist_ok=True)
                 folder_sets += 1
                 for file_idx, src in enumerate(chunk):
-                    frame_time = base_time + frame_index * 2
+                    frame_time = base_time + len(jobs) * 2
                     time_str = time.strftime("%Y:%m:%d %H:%M:%S", time.localtime(frame_time))
-                    out_filename = f"HNI_{file_idx + 1:04d}.JPG"
-                    new_filepath = os.path.join(part_dir, out_filename)
-                    try:
-                        with Image.open(src) as img:
-                            img_processed = self.apply_scaling_to_image(img, 640, 480)
-                            img_processed.info.clear()
-                            self.encode_and_sign_frame_safe(img_processed, time_str, new_filepath)
-                        if remove_sources and os.path.exists(src):
-                            os.unlink(src)
-                        os.utime(new_filepath, (frame_time, frame_time))
+                    new_filepath = os.path.join(part_dir, f"HNI_{file_idx + 1:04d}.JPG")
+                    jobs.append([src, new_filepath, time_str, frame_time])
+
+        if not jobs:
+            return 0, folder_sets
+        total = len(jobs)
+
+        params = {
+            "bg_type": self.bg_type,
+            "scale_mode": self.scale_mode,
+            "grid_dims": self.get_grid_dimensions(),
+            "advanced_settings": dict(self.advanced_settings),
+            "bg_image_path": self.bg_image_path,
+        }
+        work = [(j[0], j[1], j[2], params) for j in jobs]
+
+        def _report(done):
+            self._ui_call(lambda p=p_start + p_span * (done / max(1, total)): self.progress_bar.set(p))
+
+        pool = None
+        is_low_end_mode = bool(self.advanced_settings.get("performance_mode", False))
+        self.set_export_priority(low_end_mode=is_low_end_mode)
+        try:
+            try:
+                from concurrent.futures import ProcessPoolExecutor
+                pool = ProcessPoolExecutor(max_workers=self.get_export_worker_count())
+            except Exception as e:
+                print(f"[SIGMAFLIP] Multiprocessing unavailable, falling back to single-process export: {e}")
+
+            signed_count = 0
+            if pool is not None:
+                try:
+                    done = 0
+                    for ok in pool.map(_process_and_sign_job, work, chunksize=4):
+                        if ok:
+                            signed_count += 1
+                        done += 1
+                        _report(done)
+                except Exception as e:
+                    print(f"[SIGMAFLIP] Multiprocessing export failed, falling back to single-process export: {e}")
+                    pool.shutdown()
+                    pool = None
+
+            if pool is None:
+                for i, job in enumerate(work):
+                    ok = _process_and_sign_job(job)
+                    if ok:
                         signed_count += 1
-                    except Exception as e:
-                        print(f"Error processing {os.path.basename(src)} inside {os.path.basename(part_dir)}: {e}")
-                    self._ui_call(lambda p=(signed_count / max(1, total)): self.progress_bar.set(p))
-                    frame_index += 1
+                    _report(i + 1)
+        finally:
+            self.set_export_priority(low_end_mode=False)
+
+        for src, new_filepath, _time_str, frame_time in jobs:
+            if remove_sources and os.path.exists(src) and os.path.exists(new_filepath):
+                try:
+                    os.unlink(src)
+                except Exception:
+                    pass
+            try:
+                os.utime(new_filepath, (frame_time, frame_time))
+            except Exception:
+                pass
+
         return signed_count, folder_sets
 
     def run_batch_image_export_pipeline(self, output_dir: str) -> None:
@@ -2475,46 +2835,15 @@ class SIGMAFLIP:
         effective_dur = self.get_effective_duration()
         frame_limit = max(1, math.ceil(effective_dur * target_fps))
 
-        fps_filter = f"fps={target_fps}:round=up"
+        temp_dir = tempfile.mkdtemp(prefix="sigmaflip_export_")
+        temp_pattern = os.path.join(temp_dir, "frame_%05d.png")
 
-        if self.scale_mode == "Fit":
-            if bg_type == "custom" and self.bg_image_path and os.path.exists(self.bg_image_path):
-                filter_complex = (
-                    f"[0:v]scale=640:480:force_original_aspect_ratio=decrease[fg];"
-                    f"[1:v]scale=640:480[bg];"
-                    f"[bg][fg]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2,fps={target_fps}:round=up"
-                )
-                cmd = [
-                    ffmpeg_path, "-y",
-                    "-i", self.video_path,
-                    "-i", self.bg_image_path,
-                    "-filter_complex", filter_complex,
-                    "-frames:v", str(frame_limit),
-                    "-q:v", "2", os.path.join(output_dir, "HNI_%04d.JPG")
-                ]
-            else:
-                color_str = "white" if bg_type == "white" else "black"
-                vf_filter = f"{fps_filter},scale=640:480:force_original_aspect_ratio=decrease,pad=640:480:(ow-iw)/2:(oh-ih)/2:color={color_str}"
-                cmd = [
-                    ffmpeg_path, "-y", "-i", self.video_path,
-                    "-vf", vf_filter,
-                    "-frames:v", str(frame_limit),
-                    "-q:v", "2", os.path.join(output_dir, "HNI_%04d.JPG")
-                ]
-        else:
-            if self.scale_mode == "Stretch":
-                vf_filter = f"{fps_filter},scale=640:480"
-            elif self.scale_mode in ("Tiles", "Tiles Stretched"):
-                vf_filter = f"{fps_filter},scale=640:480:force_original_aspect_ratio=decrease"
-            else:
-                vf_filter = f"{fps_filter},scale=640:480:force_original_aspect_ratio=increase,crop=640:480"
-
-            cmd = [
-                ffmpeg_path, "-y", "-i", self.video_path,
-                "-vf", vf_filter,
-                "-frames:v", str(frame_limit),
-                "-q:v", "2", os.path.join(output_dir, "HNI_%04d.JPG")
-            ]
+        cmd = [
+            ffmpeg_path, "-y", "-i", self.video_path,
+            "-vf", f"fps={target_fps}:round=up",
+            "-frames:v", str(frame_limit),
+            "-an", temp_pattern
+        ]
 
         try:
             self._exporting = True
@@ -2531,25 +2860,24 @@ class SIGMAFLIP:
                     try:
                         parts = line.split("frame=")[1].strip().split()
                         curr_exported_frame = int(parts[0])
-                        progress_val = min(1.0, curr_exported_frame / max(1, expected_frames))
+                        progress_val = min(0.5, (curr_exported_frame / max(1, expected_frames)) * 0.5)
                         self._ui_call(lambda p=progress_val: self.progress_bar.set(p))
                     except Exception:
                         pass
             process.wait()
 
-            temp_filenames = [
-                f for f in os.listdir(output_dir)
-                if f.lower().endswith((".jpg", ".jpeg"))
-            ] if os.path.isdir(output_dir) else []
+            temp_filenames = sorted([
+                f for f in os.listdir(temp_dir)
+                if f.lower().endswith(".png")
+            ]) if os.path.isdir(temp_dir) else []
 
             if process.returncode == 0 and temp_filenames:
                 self._ui_call(lambda: self.file_name_label.configure(text="Timestamping, Signing & Splitting...", text_color=MAIN_COLOR))
 
-                temp_filenames.sort()
                 base_time = time.time()
-                sources = [os.path.join(output_dir, f) for f in temp_filenames]
+                sources = [os.path.join(temp_dir, f) for f in temp_filenames]
                 signed_count, folder_sets = self._sign_and_partition(
-                    output_dir, sources, base_time, remove_sources=True)
+                    output_dir, sources, base_time, remove_sources=False, progress_range=(0.5, 1.0))
 
                 self._ui_call(lambda: self.play_sound('apply.mp3'))
                 self._ui_call(lambda: self.file_name_label.configure(text=os.path.basename(self.video_path), text_color=SUB_COLOR))
@@ -2567,6 +2895,7 @@ class SIGMAFLIP:
             self._ui_call(lambda err=e: messagebox.showerror("Pipeline Failure", f"An error occurred:\n{str(err)}"))
         finally:
             self._exporting = False
+            shutil.rmtree(temp_dir, ignore_errors=True)
             self._ui_call(lambda: self.toggle_widgets_interactive_state(enabled=True))
             self._ui_call(lambda: self.progress_bar.set(1.0))
 
@@ -2585,7 +2914,10 @@ class SIGMAFLIP:
         self.next_btn.configure(state=state)
         self.end_btn.configure(state=state)
         if hasattr(self, 'tile_link_btn'):
-            self.tile_link_btn.configure(state=state)
+            tile_icon = 'lock' if self.tile_link_locked else 'unlock'
+            if not enabled:
+                tile_icon = f"{tile_icon}_disabled"
+            self.tile_link_btn.configure(state=state, image=self.icons.get(tile_icon))
         if hasattr(self, 'tile_cols_entry'):
             self.tile_cols_entry.configure(state=state)
         if hasattr(self, 'tile_rows_entry'):
