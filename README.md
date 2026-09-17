@@ -9,7 +9,7 @@ The ultimate tool for shitposting on Flipnote Studio. Or in other words, a FOSS 
 > [!WARNING]
 > While this tool only signs pictures/split video frames into readable JPEGs, I am NOT liable on what you use this tool for or what content you convert. Please proceed at your own risk!
 
-## What it is and what it's not:
+## What it is and what it's not
 ✔ Another JPEG signer for the DSi, focused primarily for Flipnote Studio. <br>
 ✔ An open source SignaPic DSi alternative <br>
 ❌ A PPM encoder <br>
@@ -25,7 +25,7 @@ By pure accident. The story is, I thought that I can use this tool to only split
 The purpose is to obviously convert frames or pictures into a readable DSi format... To give some idea, perhaps record something on your phone and convert it with SIGMAFLIP, or make a stop motion animation with your camera and take all the frames then convert them back into Flipnote Studio (you have the DSi/3DS that does this), make pixel art on your PC, or convert a funny meme and port the frames into SIGMAFLIP, then port every frame back to Flipnote Studio. That's all I can suggest! For the bans, no. The only ban you could get is ***flipnote signing***. Both SIGMAFLIP and SignaPic are DSi JPEG signers, not flipnote encoders.
 
 ## How to use this?
-Choose the dropdown mode between Video Frames or Singular Image, then click the <img width=30 src=https://github.com/CybernatedChris/SIGMAFLIP/blob/main/sf/assets/img/upload.png> button. For Video Frames, choose any video supported by SIGMAFLIP, GIFS are considered a video format. For Singular Image, uploading one singular image can only output HNI_0001.JPG, not the entire folder structure. Otherwise you can upload multiple images and convert and sort them all from there.
+Choose the dropdown mode between Video Frames or Still Images, then click the <img width=30 src=https://github.com/CybernatedChris/SIGMAFLIP/blob/main/sf/assets/img/upload.png> button. For Video Frames, choose any video supported by SIGMAFLIP, GIFS are considered a video format. For Still Images, uploading one single image can only output HNI_0001.JPG, not the entire folder structure. Otherwise you can upload multiple images and convert and sort them all from there.
 
 ### Importing images onto a 3DS 
 The DCIM structure for the 3DS is very much the same as the DSi, just different naming. Unlike the DSi, **you don't need to delete a pit.bin file. Use the 3DS Camera instead.**
@@ -35,9 +35,9 @@ The DCIM structure for the 3DS is very much the same as the DSi, just different 
 |-------|--------|---------|
 | Platform | Windows Only* | Cross Platform** |
 | Video support? | ❌ | ✔ |
-| File Format | JPEG only   | PNG, JPEG/JPG, WEBP, BMP (Singular Image) MP4 AVI MOV MKV GIF (Video Frames)|
+| File Format | JPEG only | PNG, JPEG/JPG, WEBP, BMP (Still Images) MP4 AVI MOV MKV GIF (Video Frames)|
 | Last Activity | around 2019 to 2022 | 2026 and beyond (until I say so) |
-| Other known features | Resizing, widecut, and proportionate images, DPI optimization | More resizing options such as title layout, additional filters, black/white/custom backgrounds, display inversion, DCIM tree or Part_X tree exporting layouts, 3DS support, pit.bin deletion/detection confirmation|
+| Other known features | Resizing, widecut, and proportionate images, DPI optimization | More resizing options such as title layout, additional filters, black/white/custom backgrounds, display inversion, DCIM tree or Part_X tree exporting layouts, 3DS support, pit.bin deletion/detection confirmation, video export watermark|
 
 *Works natively under Wine <br />
 **Desktop only
@@ -79,7 +79,7 @@ python main.py
 <img width="502" height="632" alt="imageselector" src="https://github.com/user-attachments/assets/083ce05a-21e2-462d-8f20-fbd0fa9c3be9" />
 <img width="502" height="632" alt="imgselectorbulkpreview" src="https://github.com/user-attachments/assets/6b4f1c35-c63e-4b69-9e38-5d33df13be1d" />
 
-## Video Demos:
+## Video Demos
 ### Running on Windows 10 LTSC 21h2
 https://github.com/user-attachments/assets/b0c372c4-e0da-4705-a62d-e6118309216f
 ###### Demo video as of v1
@@ -89,7 +89,7 @@ https://github.com/user-attachments/assets/0b2bb66f-1678-4088-b2b9-e8ef4a67d861
 ###### Demo video as of v1.2.1
 
 
-## Limitations:
+## Limitations
 ### Flipnote Memory Saver filter
 
 The Flipnote Memory Saver filter is experimental. When you use the filter in Flipnote Studio, you must move the cursor at any of these spots, depending if you applied display inversion: <br />
