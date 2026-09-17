@@ -43,8 +43,8 @@ The DCIM structure for the 3DS is very much the same as the DSi, just different 
 **Desktop only
 
 ## What you need (for manually executing):
-- Python 3.14+ recommended
-- FFmpeg
+- Latest Python recommended, at least Python 3.10 for it's minimum
+- The latest version of FFmpeg recommended too
 
 ### Manual execution
 #### By manually running, be sure to keep the assets folder in the same directory as the main.py script, or else you will encounter errors. <br>
@@ -101,7 +101,9 @@ Picture without display inversion is on the left, picture with display inversion
 Your image may appear darker/lighter than expected, use the contrast settings.
 
 ### Video/GIF Frame Exporting
-Sometimes, videos/GIFs could have a low frame count. When you increase your speed, your videos/GIFs may have the same frame count resulting your flipnote to be faster than what you see.
+Sometimes, videos/GIFs could have a low frame count. When you increase your speed, your videos/GIFs may have the same frame count resulting your flipnote to be faster than what you see *(now unsure as of v1.3.1)*
+
+Video FPS mismatches can produce duplicated frames according to Flipnote Speed
 
 ## Special Thanks
 - cimo95: inspiration of the SIGMAFLIP [(see SignaPic DSi here)](https://gbatemp.net/threads/signapic-dsi-simple-step-to-import-any-jpg-images-into-nintendo-dsi.552288/)
