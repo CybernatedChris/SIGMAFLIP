@@ -1,52 +1,57 @@
-# sf/advanced.py
 import os
 import customtkinter as ctk
 import tkinter as tk
-from sf.config import draw_grid_on_canvas
+from sf.config import attach_grid_background
 
-def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, settings, on_change_callback, set_icon_fn, get_export_structure=None, get_console_type=None, theme_bg=None):
-    """Generates a styled, centered, modeless Advanced Settings window with transparent frames."""
+_INTERACTIVE = (ctk.CTkButton, ctk.CTkEntry, ctk.CTkSwitch, ctk.CTkSlider,
+                ctk.CTkOptionMenu, ctk.CTkSegmentedButton, ctk.CTkCheckBox)
+_CONTAINER = (ctk.CTkFrame, tk.Frame)
+
+
+def set_interactive_state(widget, enabled, skip=()):
+    for child in widget.winfo_children():
+        if any(child is s for s in skip):
+            continue
+        if isinstance(child, _INTERACTIVE):
+            try:
+                child.configure(state="normal" if enabled else "disabled")
+            except Exception:
+                pass
+        elif isinstance(child, _CONTAINER):
+            set_interactive_state(child, enabled, skip)
+
+
+def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, settings, on_change_callback, set_icon_fn, get_export_structure=None, get_console_type=None, theme_bg=None, get_exporting=None, get_export_mode=None):
+    """Modeless Advanced Settings window."""
     adv = ctk.CTkToplevel(parent)
     adv.title("Advanced Settings")
     adv.geometry("400x650")
     adv.resizable(False, False)
     adv.transient(parent)
-    
+
     theme_bg = theme_bg or ("#f3f4f6", "#151515")
     adv.configure(fg_color=theme_bg)
-    
+
     set_icon_fn(adv, delay=True)
 
-    bg_canvas = tk.Canvas(adv, bg="#1a1a1a", highlightthickness=0, bd=0)
-    bg_canvas.place(x=0, y=0, relwidth=1, relheight=1)
-
-    last_grid = {"w": 0, "h": 0}
-    def draw_bg(event=None):
-        w = adv.winfo_width()
-        h = adv.winfo_height()
-        if w == last_grid["w"] and h == last_grid["h"]:
-            return
-        last_grid.update(w=w, h=h)
-        draw_grid_on_canvas(bg_canvas, w, h, ctk.get_appearance_mode().lower())
-    adv.bind("<Configure>", draw_bg)
+    attach_grid_background(adv)
 
     adv.update_idletasks()
     x = parent.winfo_rootx() + (parent.winfo_width() - adv.winfo_width()) // 2
     y = parent.winfo_rooty() + (parent.winfo_height() - adv.winfo_height()) // 2
     adv.geometry(f"+{x}+{y}")
 
-    frame = ctk.CTkFrame(adv, fg_color="transparent")
-    frame.pack(fill=tk.BOTH, expand=True, padx=25, pady=20)
+    frame = ctk.CTkScrollableFrame(adv, fg_color="transparent")
+    frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
 
     ctk.CTkLabel(
-        frame, 
-        text="Rendering Options", 
-        font=fonts['medium_bold'], 
+        frame,
+        text="Rendering Options",
+        font=fonts['medium_bold'],
         text_color=main_color,
         fg_color="transparent"
     ).pack(anchor="center", pady=(0, 10))
 
-    # JPG Quality
     jpg_quality_frame = ctk.CTkFrame(frame, fg_color="transparent")
     jpg_quality_frame.pack(fill="x", pady=5)
 
@@ -158,21 +163,19 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
     ).pack(side=tk.LEFT, padx=(0, 10))
 
     dither_modes = [
-        "None", 
-        "Floyd-Steinberg", 
-        "Bayer 2x2", 
-        "Bayer 3x3", 
-        "Bayer 4x4", 
-        "Bayer 8x8", 
-        "Bayer 16x16",
-        "Bayer 32x32",
+        "None",
+        "Floyd-Steinberg",
+        "Bayer 2x2",
+        "Bayer 3x3",
+        "Bayer 4x4",
+        "Bayer 8x8",
         "Blue Noise 64x64",
         "Flipnote Memory Saver (Experimental)",
-        "Atkinson", 
-        "Jarvis-Judice-Ninke", 
-        "Sierra 3-Row", 
-        "Sierra Lite", 
-        "Stevenson-Arce", 
+        "Atkinson",
+        "Jarvis-Judice-Ninke",
+        "Sierra 3-Row",
+        "Sierra Lite",
+        "Stevenson-Arce",
         "Dot Diffusion",
         "Riemersma",
         "Halftone",
@@ -215,7 +218,7 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
     )
     dither_menu.bind("<Button-1>", show_dither_menu)
     dither_menu.pack(side=tk.LEFT, fill="x", expand=True)
-    
+
     if not bw_var.get():
         dither_menu.configure(state="disabled")
 
@@ -250,10 +253,133 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
     contrast_slider.set(settings.get("contrast", 1.0))
     contrast_slider.pack(fill="x", pady=(5, 0))
 
+    wm_section = ctk.CTkFrame(frame, fg_color="transparent")
+    wm_section.pack(fill="x")
+
     ctk.CTkLabel(
-        frame, 
-        text="Export Options", 
-        font=fonts['medium_bold'], 
+        wm_section,
+        text="Watermark",
+        font=fonts['medium_bold'],
+        text_color=main_color,
+        fg_color="transparent"
+    ).pack(anchor="center", pady=(15, 6))
+
+    wm_enable_var = tk.BooleanVar(value=settings.get("watermark_enabled", False))
+    def toggle_wm():
+        settings["watermark_enabled"] = wm_enable_var.get()
+        on_change_callback()
+
+    ctk.CTkSwitch(
+        wm_section,
+        text="Enable Watermark Overlay",
+        font=fonts['small'],
+        text_color=main_color,
+        variable=wm_enable_var,
+        command=toggle_wm,
+        progress_color=highlight_color
+    ).pack(anchor="w", pady=6)
+
+    wm_path_var = tk.StringVar(value=os.path.basename(settings.get("watermark_path", "")) or "Default watermark")
+    ctk.CTkLabel(
+        wm_section,
+        textvariable=wm_path_var,
+        font=fonts['tiny'],
+        text_color=sub_color,
+        fg_color="transparent",
+        wraplength=330
+    ).pack(anchor="w")
+
+    wm_btn_row = ctk.CTkFrame(wm_section, fg_color="transparent")
+    wm_btn_row.pack(fill="x", pady=(4, 6))
+
+    def browse_watermark():
+        from tkinter import filedialog
+        chosen = filedialog.askopenfilename(
+            title="Select Watermark Image",
+            filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.webp")]
+        )
+        if chosen:
+            settings["watermark_path"] = chosen
+            settings["watermark_enabled"] = True
+            wm_enable_var.set(True)
+            wm_path_var.set(os.path.basename(chosen))
+            on_change_callback()
+
+    def reset_watermark_file():
+        settings["watermark_path"] = ""
+        wm_path_var.set("Default watermark")
+        on_change_callback()
+
+    ctk.CTkButton(
+        wm_btn_row,
+        text="Browse...",
+        font=fonts['tiny'],
+        fg_color=("#2563eb", "#3b82f6"),
+        hover_color=highlight_color,
+        text_color="#ffffff",
+        command=browse_watermark
+    ).pack(side="left", expand=True, fill="x", padx=(0, 4))
+    ctk.CTkButton(
+        wm_btn_row,
+        text="Reset",
+        font=fonts['tiny'],
+        fg_color=("#6b7280", "#4b5563"),
+        hover_color=highlight_color,
+        text_color="#ffffff",
+        command=reset_watermark_file
+    ).pack(side="left", expand=True, fill="x", padx=(4, 0))
+
+    pos_map = {"Top Left": "topleft", "Top Right": "topright",
+               "Bottom Left": "bottomleft", "Bottom Right": "bottomright"}
+    rev_pos_map = {v: k for k, v in pos_map.items()}
+
+    def on_pos_select(val):
+        settings["watermark_position"] = pos_map.get(val, "bottomright")
+        on_change_callback()
+
+    pos_seg = ctk.CTkSegmentedButton(
+        wm_section,
+        values=list(pos_map.keys()),
+        command=on_pos_select,
+        font=fonts['tiny'],
+        selected_color=highlight_color,
+        selected_hover_color=highlight_color
+    )
+    pos_seg.set(rev_pos_map.get(settings.get("watermark_position", "bottomright"), "Bottom Right"))
+    pos_seg.pack(fill="x", pady=6)
+
+    scale_label_var = tk.StringVar(value=f"Scale: {settings.get('watermark_scale', 40)}% width")
+    ctk.CTkLabel(
+        wm_section,
+        textvariable=scale_label_var,
+        font=fonts['tiny'],
+        text_color=sub_color,
+        fg_color="transparent"
+    ).pack(anchor="w")
+
+    def on_scale_change(val):
+        v = int(float(val))
+        settings["watermark_scale"] = v
+        scale_label_var.set(f"Scale: {v}% width")
+        on_change_callback()
+
+    scale_slider = ctk.CTkSlider(
+        wm_section,
+        from_=5,
+        to=60,
+        number_of_steps=55,
+        button_color=main_color,
+        button_hover_color=highlight_color,
+        progress_color=main_color,
+        command=on_scale_change
+    )
+    scale_slider.set(settings.get("watermark_scale", 40))
+    scale_slider.pack(fill="x", pady=(2, 6))
+
+    ctk.CTkLabel(
+        frame,
+        text="Export Options",
+        font=fonts['medium_bold'],
         text_color=main_color,
         fg_color="transparent"
     ).pack(anchor="center", pady=(0, 10))
@@ -297,7 +423,8 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
     if get_export_structure is not None:
         def poll_structure():
             if adv.winfo_exists():
-                if get_export_structure() == "parts":
+                exporting = bool(get_exporting and get_exporting())
+                if exporting or get_export_structure() == "parts":
                     capacity_entry.configure(state="disabled")
                     capacity_label.configure(text_color=("#9ca3af", "#6b7280"))
                 else:
@@ -307,9 +434,9 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         adv.after(500, poll_structure)
 
     pit_title_label = ctk.CTkLabel(
-        frame, 
-        text="Pit File", 
-        font=fonts['medium_bold'], 
+        frame,
+        text="Pit File",
+        font=fonts['medium_bold'],
         text_color=main_color,
         fg_color="transparent"
     )
@@ -388,13 +515,36 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
     if get_console_type is not None:
         def poll_console():
             if adv.winfo_exists():
-                if get_console_type() == "3ds":
-                    pit_title_label.configure(text_color=("#dc2626", "#ef4444"))
-                    browse_btn.configure(state="disabled")
-                    delete_btn.configure(state="disabled")
-                else:
-                    pit_title_label.configure(text_color=main_color)
-                    browse_btn.configure(state="normal")
-                    delete_btn.configure(state="normal")
+                exporting = bool(get_exporting and get_exporting())
+                is_3ds = get_console_type() == "3ds"
+                pit_title_label.configure(text_color=("#dc2626", "#ef4444") if is_3ds else main_color)
+                pit_state = "disabled" if (exporting or is_3ds) else "normal"
+                browse_btn.configure(state=pit_state)
+                delete_btn.configure(state=pit_state)
                 adv.after(500, poll_console)
         adv.after(500, poll_console)
+
+    if get_exporting is not None:
+        gated = (dither_menu, perf_switch, invert_switch)
+        def apply_state(exporting, still_mode):
+            gated_state = "disabled" if exporting else ("normal" if bw_var.get() else "disabled")
+            for widget in gated:
+                widget.configure(state=gated_state)
+            set_interactive_state(
+                frame, not exporting,
+                skip=gated + (capacity_entry, browse_btn, delete_btn, wm_section))
+            set_interactive_state(wm_section, not (exporting or still_mode))
+        last = {"exporting": None, "still": None}
+        def poll_state():
+            if not adv.winfo_exists():
+                return
+            exporting = bool(get_exporting())
+            still_mode = bool(get_export_mode and get_export_mode() == "Still Images")
+            if last["exporting"] != exporting or last["still"] != still_mode:
+                last["exporting"] = exporting
+                last["still"] = still_mode
+                apply_state(exporting, still_mode)
+            adv.after(300, poll_state)
+        poll_state()
+
+    return adv
