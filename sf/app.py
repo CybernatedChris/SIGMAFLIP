@@ -17,10 +17,12 @@ import tkinter as tk
 from tkinter import messagebox, filedialog
 import customtkinter as ctk
 from PIL import Image, ImageTk, ImageEnhance
+Image.MAX_IMAGE_PIXELS = 100_000_000
 
 from sf.config import (
     IS_WINDOWS, IS_MAC, IS_LINUX, MAIN_COLOR, SUB_COLOR,
-    MAX_FRAMES, SPEED_FPS, load_custom_font, WARNING_DURATION, draw_grid_on_canvas
+    MAX_FRAMES, SPEED_FPS, load_custom_font, WARNING_DURATION,
+    draw_grid_on_canvas, attach_grid_background
 )
 from sf.about import show_about_dialog
 from sf.dither import (apply_ordered_dither, apply_error_diffusion,
@@ -28,6 +30,19 @@ from sf.dither import (apply_ordered_dither, apply_error_diffusion,
 
 if IS_WINDOWS:
     import ctypes
+
+def _open_in_file_manager(path):
+    if not os.path.isdir(path):
+        return
+    try:
+        if IS_WINDOWS:
+            os.startfile(path)
+        elif IS_MAC:
+            subprocess.Popen(["open", "--", path])
+        else:
+            subprocess.Popen(["xdg-open", "--", path])
+    except Exception:
+        pass
 
 try:
     from Crypto.Cipher import AES
@@ -44,7 +59,18 @@ VIDEO_EXTS = (".mp4", ".avi", ".mov", ".mkv", ".gif")
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+def _user_config_dir():
+    if IS_WINDOWS:
+        return os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "SIGMAFLIP")
+    if IS_MAC:
+        return os.path.join(os.path.expanduser("~"), "Library", "Application Support", "SIGMAFLIP")
+    return os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config", "SIGMAFLIP")
+
+# Shared pipeline at module level (thread-safe, avoids per-process imports)
+
 DSI_JPEG_KEY = bytes.fromhex("70885206DFE5016D45EAC52333D6446F")
+
+_TLS = threading.local()
 
 
 def _gf_mul2_mod(block: bytes) -> bytes:
@@ -56,9 +82,11 @@ def _gf_mul2_mod(block: bytes) -> bytes:
 
 
 def _dsi_ccm_tag_mod(data: bytes, nonce: bytes) -> bytes:
-    key = DSI_JPEG_KEY
-    rev_key = key[::-1]
-    ecb = AES.new(rev_key, AES.MODE_ECB)
+    ecb = getattr(_TLS, "ecb", None)
+    if ecb is None:
+        ecb = AES.new(DSI_JPEG_KEY[::-1], AES.MODE_ECB)
+        _TLS.ecb = ecb
+        _TLS.zero_enc_rev = ecb.encrypt(b'\x00' * 16)[::-1]
 
     size = len(data)
     total_size = (size + 15) & ~15
@@ -66,8 +94,7 @@ def _dsi_ccm_tag_mod(data: bytes, nonce: bytes) -> bytes:
     buf.extend(b'\x00' * (total_size - size))
     buf[0x18A:0x1A6] = b'\x00' * 0x1C
 
-    block = ecb.encrypt(b'\x00' * 16)[::-1]
-    block = _gf_mul2_mod(block)
+    block = _gf_mul2_mod(_TLS.zero_enc_rev)
     final_bytes = ((size - 1) & 0xF) + 1
     if final_bytes == 0x10:
         block = bytes(a ^ b for a, b in zip(block, bytes(buf[size - 16:size])))
@@ -96,26 +123,6 @@ def sign_jpeg_dsi_mod(data: bytes) -> bytes:
     out[0x18A:0x18A + 12] = nonce
     out[0x196:0x196 + 16] = tag
     return bytes(out)
-
-
-def verify_dsi_signature_mod(data: bytes) -> bool:
-    try:
-        if len(data) < 0x1A6:
-            return False
-        nonce = bytes(data[0x18A:0x18A + 12])
-        tag_stored = bytes(data[0x196:0x196 + 16])
-        return _dsi_ccm_tag_mod(data, nonce) == tag_stored
-    except Exception:
-        return False
-
-
-def verify_jpeg_structure_mod(data: bytes) -> bool:
-    try:
-        with Image.open(io.BytesIO(data)) as img:
-            img.verify()
-        return True
-    except Exception:
-        return False
 
 
 def build_dsi_exif_mod(time_str: str, thumb_jpeg: bytes) -> bytes:
@@ -193,72 +200,100 @@ def build_dsi_exif_mod(time_str: str, thumb_jpeg: bytes) -> bytes:
     return be16(len(payload) + 2) + payload
 
 
-def encode_sign_frame_mod(pil_img: Image.Image, time_str: str, target_path: str) -> bool:
-    quality = 95
+def encode_sign_frame_mod(pil_img: Image.Image, time_str: str, target_path: str, quality: int = 95) -> bool:
     MAX_FILE_SIZE = 140000
-    img_data = None
+    try:
+        thumb_buf = io.BytesIO()
+        pil_img.resize((160, 120), Image.Resampling.BOX).convert("RGB").save(
+            thumb_buf, format="JPEG", quality=70, subsampling=2)
+        app1 = b"\xFF\xE1" + build_dsi_exif_mod(time_str, thumb_buf.getvalue())
 
-    for attempt in range(6):
-        img_copy = pil_img.copy()
-        img_copy.info.clear()
-
-        try:
-            thumb_buf = io.BytesIO()
-            img_copy.resize((160, 120), Image.LANCZOS).convert("RGB").save(
-                thumb_buf, format="JPEG", quality=75, subsampling=2)
+        signed_data = None
+        curr_q = quality
+        for _ in range(5):
             main_buf = io.BytesIO()
-            img_copy.convert("RGB").save(
-                main_buf, format="JPEG", quality=quality, subsampling=0)
-            mdata = main_buf.getvalue()
-            body = mdata[2:]
-            app1 = b"\xFF\xE1" + build_dsi_exif_mod(time_str, thumb_buf.getvalue())
-            img_data = b"\xFF\xD8" + app1 + body
-        except Exception:
-            quality -= 5
-            continue
+            pil_img.convert("RGB").save(
+                main_buf, format="JPEG", quality=curr_q, subsampling=0, optimize=False)
+            body = main_buf.getvalue()[2:]
+            signed_data = sign_jpeg_dsi_mod(b"\xFF\xD8" + app1 + body)
+            if len(signed_data) <= MAX_FILE_SIZE:
+                break
+            curr_q -= 10
 
-        signed_data = sign_jpeg_dsi_mod(img_data)
-
-        size_ok = len(signed_data) <= MAX_FILE_SIZE
-        sig_ok = verify_dsi_signature_mod(signed_data)
-        struct_ok = verify_jpeg_structure_mod(signed_data)
-
-        if sig_ok and struct_ok and size_ok:
-            with open(target_path, "wb") as f:
-                f.write(signed_data)
-            return True
-
-        if not size_ok:
-            quality -= 8
-        else:
-            quality -= 3
-
-    if img_data is None:
+        if signed_data is None:
+            return False
+        with open(target_path, "wb") as f:
+            f.write(signed_data)
+        return len(signed_data) <= MAX_FILE_SIZE
+    except Exception as e:
+        print(f"[SIGMAFLIP] Frame encoding failed: {e}")
         return False
-    signed_data = sign_jpeg_dsi_mod(img_data)
-    with open(target_path, "wb") as f:
-        f.write(signed_data)
-    return False
 
 
 _BG_SRC_CACHE = {}
+_WATERMARK_CACHE = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def _get_rendered_watermark(wm_path, target_w, scale_pct=40):
+    if not wm_path or not os.path.isfile(wm_path):
+        return None
+    key = (wm_path, target_w, int(scale_pct))
+    with _CACHE_LOCK:
+        cached = _WATERMARK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        with Image.open(wm_path) as raw:
+            wm = raw.convert("RGBA")
+        wm_w = max(16, int(target_w * (scale_pct / 100.0)))
+        wm_h = max(1, int(wm.height * (wm_w / wm.width)))
+        wm = wm.resize((wm_w, wm_h), Image.Resampling.BILINEAR)
+        with _CACHE_LOCK:
+            if len(_WATERMARK_CACHE) > 64:
+                _WATERMARK_CACHE.clear()
+            _WATERMARK_CACHE[key] = wm
+        return wm
+    except Exception:
+        return None
 
 
 def _load_custom_background_mod(path, size, resample):
     if not path or not os.path.isfile(path):
         return Image.new("RGB", size, "black")
     try:
-        cached = _BG_SRC_CACHE.get(path)
+        with _CACHE_LOCK:
+            cached = _BG_SRC_CACHE.get(path)
         if cached is None:
             with Image.open(path) as src:
                 src.load()
                 src = src.convert("RGB")
                 src.thumbnail((640, 480), Image.Resampling.LANCZOS)
             cached = src
-            _BG_SRC_CACHE[path] = cached
+            with _CACHE_LOCK:
+                _BG_SRC_CACHE[path] = cached
         return cached.resize(size, resample)
     except Exception:
         return Image.new("RGB", size, "black")
+
+
+def purge_orphaned_export_dirs(max_age_hours=24):
+    # age guard so a live export from another instance is not clobbered
+    tmp_root = tempfile.gettempdir()
+    cutoff = time.time() - max_age_hours * 3600
+    try:
+        for name in os.listdir(tmp_root):
+            if not name.startswith("sigmaflip_export_"):
+                continue
+            p = os.path.join(tmp_root, name)
+            try:
+                if os.path.isdir(p) and (IS_WINDOWS or os.stat(p).st_uid == os.getuid()) \
+                        and os.path.getmtime(p) < cutoff:
+                    shutil.rmtree(p, ignore_errors=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def _apply_advanced_filters_mod(img, advanced_settings, exporting, playing):
@@ -277,26 +312,21 @@ def _apply_advanced_filters_mod(img, advanced_settings, exporting, playing):
         dither = advanced_settings.get("dither_mode", "None")
 
         if dither == "Floyd-Steinberg":
-            dither_algo = getattr(Image, "Dither", None)
-            if dither_algo and hasattr(dither_algo, "FLOYDSTEINBERG"):
-                algo = dither_algo.FLOYDSTEINBERG
-            else:
-                algo = getattr(Image, "FLOYDSTEINBERG", 3)
-            bw_img = gray_img.convert("1", dither=algo)
+            bw_img = gray_img.convert("1", dither=Image.Dither.FLOYDSTEINBERG)
         elif dither in ("Bayer 2x2", "Bayer 3x3", "Bayer 4x4", "Bayer 8x8",
-                        "Bayer 16x16", "Bayer 32x32", "Blue Noise 64x64",
+                        "Blue Noise 64x64",
                         "Halftone", "Flipnote Memory Saver (Experimental)"):
             bw_img = apply_ordered_dither(gray_img, dither)
         elif dither in ("Atkinson", "Jarvis-Judice-Ninke",
                         "Sierra 3-Row", "Sierra Lite",
                         "Stevenson-Arce"):
-            bw_img = apply_error_diffusion(gray_img, dither, exporting, False)
+            bw_img = apply_error_diffusion(gray_img, dither)
         elif dither == "Dot Diffusion":
-            bw_img = apply_dot_diffusion(gray_img, exporting, False)
+            bw_img = apply_dot_diffusion(gray_img)
         elif dither == "Riemersma":
-            bw_img = apply_riemersma(gray_img, exporting, False)
+            bw_img = apply_riemersma(gray_img)
         elif dither == "Woodcut":
-            bw_img = apply_woodcut(gray_img, exporting, False)
+            bw_img = apply_woodcut(gray_img)
         else:
             bw_img = gray_img.point(lambda x: 255 if x > 127 else 0, mode="1")
 
@@ -309,7 +339,8 @@ def _apply_advanced_filters_mod(img, advanced_settings, exporting, playing):
 
 
 def _apply_scaling_filter_mod(img, target_w, target_h, bg_type, scale_mode, grid_dims,
-                              advanced_settings, bg_image_path, exporting, playing):
+                              advanced_settings, bg_image_path, exporting, playing,
+                              watermark_default_path="", allow_watermark=True):
     orig_w, orig_h = img.size
     pixel_precision = advanced_settings.get("pixel_precision", False)
     perf_mode = advanced_settings.get("performance_mode", False) and playing
@@ -324,10 +355,10 @@ def _apply_scaling_filter_mod(img, target_w, target_h, bg_type, scale_mode, grid
 
     if advanced_settings.get("performance_mode", False):
         scale_resample = Image.Resampling.BILINEAR
-    elif perf_mode:
-        scale_resample = Image.Resampling.NEAREST
-    else:
+    elif exporting:
         scale_resample = Image.Resampling.LANCZOS
+    else:
+        scale_resample = Image.Resampling.BOX
 
     if bg_type == "white":
         bg = Image.new("RGB", (render_w, render_h), "white")
@@ -336,7 +367,8 @@ def _apply_scaling_filter_mod(img, target_w, target_h, bg_type, scale_mode, grid
     else:
         bg = Image.new("RGB", (render_w, render_h), "black")
 
-    img_rgba = img.convert("RGBA")
+    use_mask = img.mode in ("RGBA", "LA", "PA")
+    src_img = img.convert("RGBA") if use_mask else img.convert("RGB")
     cols, rows = grid_dims
 
     if scale_mode in ("Tiles", "Tiles Stretched"):
@@ -344,44 +376,60 @@ def _apply_scaling_filter_mod(img, target_w, target_h, bg_type, scale_mode, grid
         tile_h = render_h // rows
 
         if scale_mode == "Tiles Stretched":
-            img_copy = img_rgba.resize((tile_w, tile_h), scale_resample)
+            img_copy = src_img.resize((tile_w, tile_h), scale_resample)
             for r in range(rows):
                 for col in range(cols):
                     x_offset = col * tile_w
                     y_offset = r * tile_h
-                    bg.paste(img_copy, (x_offset, y_offset), mask=img_copy)
+                    bg.paste(img_copy, (x_offset, y_offset), mask=img_copy if use_mask else None)
         else:
             scale = min(tile_w / orig_w, tile_h / orig_h)
             new_w = max(1, min(tile_w, int(round(orig_w * scale))))
             new_h = max(1, min(tile_h, int(round(orig_h * scale))))
-            img_copy = img_rgba.resize((new_w, new_h), scale_resample)
+            img_copy = src_img.resize((new_w, new_h), scale_resample)
             for r in range(rows):
                 for col in range(cols):
                     x_offset = col * tile_w + (tile_w - new_w) // 2
                     y_offset = r * tile_h + (tile_h - new_h) // 2
-                    bg.paste(img_copy, (x_offset, y_offset), mask=img_copy)
+                    bg.paste(img_copy, (x_offset, y_offset), mask=img_copy if use_mask else None)
         bg_final = bg
     elif scale_mode == "Fit":
         scale = min(render_w / orig_w, render_h / orig_h)
         new_w = max(1, min(render_w, int(round(orig_w * scale))))
         new_h = max(1, min(render_h, int(round(orig_h * scale))))
-        img_copy = img_rgba.resize((new_w, new_h), scale_resample)
-        bg.paste(img_copy, ((render_w - new_w) // 2, (render_h - new_h) // 2), mask=img_copy)
+        img_copy = src_img.resize((new_w, new_h), scale_resample)
+        bg.paste(img_copy, ((render_w - new_w) // 2, (render_h - new_h) // 2), mask=img_copy if use_mask else None)
         bg_final = bg
     elif scale_mode == "Stretch":
-        img_copy = img_rgba.resize((render_w, render_h), scale_resample)
-        bg.paste(img_copy, (0, 0), mask=img_copy)
+        img_copy = src_img.resize((render_w, render_h), scale_resample)
+        bg.paste(img_copy, (0, 0), mask=img_copy if use_mask else None)
         bg_final = bg
     else:
         scale = max(render_w / orig_w, render_h / orig_h)
         new_w = int(orig_w * scale)
         new_h = int(orig_h * scale)
-        img_scaled = img_rgba.resize((new_w, new_h), scale_resample)
+        img_scaled = src_img.resize((new_w, new_h), scale_resample)
         left = (new_w - render_w) // 2
         top = (new_h - render_h) // 2
         img_cropped = img_scaled.crop((left, top, left + render_w, top + render_h))
-        bg.paste(img_cropped, (0, 0), mask=img_cropped)
+        bg.paste(img_cropped, (0, 0), mask=img_cropped if use_mask else None)
         bg_final = bg
+
+    if allow_watermark and advanced_settings.get("watermark_enabled", False):
+        wm_path = advanced_settings.get("watermark_path") or watermark_default_path
+        wm = _get_rendered_watermark(
+            wm_path, render_w,
+            advanced_settings.get("watermark_scale", 40))
+        if wm is not None:
+            margin = max(8, int(render_w * 0.02))
+            pos = advanced_settings.get("watermark_position", "bottomright")
+            positions = {
+                "topleft": (margin, margin),
+                "topright": (render_w - wm.width - margin, margin),
+                "bottomleft": (margin, render_h - wm.height - margin),
+                "bottomright": (render_w - wm.width - margin, render_h - wm.height - margin),
+            }
+            bg_final.paste(wm, positions.get(pos, positions["bottomright"]), wm)
 
     filtered = _apply_advanced_filters_mod(bg_final, advanced_settings, exporting, playing)
 
@@ -401,6 +449,8 @@ def _process_and_sign_job(job):
             params["bg_type"], params["scale_mode"], params["grid_dims"],
             params["advanced_settings"], params["bg_image_path"],
             True, False,
+            params.get("watermark_default_path", ""),
+            params.get("allow_watermark", True),
         )
         processed.info.clear()
         return encode_sign_frame_mod(processed, time_str, dst_path)
@@ -413,9 +463,9 @@ class SIGMAFLIP:
     def __init__(self, root):
         self.root = root
         self.root.title("SIGMAFLIP")
-        self.root.geometry("500x620")  # Re-centered default layout height
+        self.root.geometry("500x620")
         self.root.resizable(False, False)
-        
+
         self._theme_bg = ("#f3f4f6", "#151515")
         self.root.configure(fg_color=self._theme_bg)
 
@@ -431,7 +481,6 @@ class SIGMAFLIP:
             self.root.destroy()
             sys.exit(1)
 
-        # Verify if numba hardware-accelerated compiling is active
         try:
             import numba
         except ImportError:
@@ -442,7 +491,6 @@ class SIGMAFLIP:
         self.highlight_color = "#{:02X}{:02X}{:02X}".format(
             *[int(c + (255 - c) * 0.65) for c in rgb])
 
-        # Resolve asset directories from nested package folder levels
         self.base_path = os.path.dirname(os.path.abspath(__file__))
         self.assets_path = os.path.join(self.base_path, 'assets')
         self.img_path = os.path.join(self.assets_path, 'img')
@@ -475,21 +523,19 @@ class SIGMAFLIP:
         self.video_fps = 24.0
         self.video_duration = 0.0
         self.current_frame_idx = 0.0
-        
-        self.image_paths = []  
+
+        self.image_paths = []
         self.still_index = 0
 
         self.bg_image_path = None
         self.gif_img = None
 
-        # Audio preview state
         self.temp_audio_path = None
         self.has_audio = False
         self.audio_duration = 0.0
         self._playback_start_time = 0.0
         self._playback_start_frame = 0.0
 
-        # Scrubbing & Preview state
         self._is_scrubbing = False
         self._was_playing_before_scrub = False
 
@@ -497,6 +543,7 @@ class SIGMAFLIP:
         self.playing = False
         self.scale_mode = "Fit"
         self.after_play_id = None
+        self._preview_refresh_id = None
         self.speed_tk_imgs = {}
 
         self.last_grid_w = 0
@@ -504,8 +551,6 @@ class SIGMAFLIP:
         self.last_grid_mode = None
 
         self._exporting = False
-        self._last_render_time = 0.0
-        self._rapid_rendering = False
 
         self.current_singular_view = "preview"  # "preview" or "grid"
         self._thumbnail_tk_images = []
@@ -513,8 +558,13 @@ class SIGMAFLIP:
         self._rearrange_mode = False
         self._rearrange_grab = False
 
-        config_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        config_dir = _user_config_dir()
+        os.makedirs(config_dir, exist_ok=True)
         self.config_filepath = os.path.join(config_dir, ".sigmaflip_config.json")
+        self._legacy_config_filepath = os.path.join(
+            os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+            else os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            ".sigmaflip_config.json")
 
         self.bg_type_var = tk.StringVar(value="black")
         self.export_structure_var = tk.StringVar(value="dcim")
@@ -530,8 +580,13 @@ class SIGMAFLIP:
             "black_and_white": False,
             "contrast": 1.0,
             "dither_mode": "None",
+            "jpg_quality": 95,
             "album_capacity": 100,
-            "pit_dir": ""
+            "pit_dir": "",
+            "watermark_enabled": False,
+            "watermark_position": "bottomright",
+            "watermark_path": "",
+            "watermark_scale": 40
         }
 
         self.sfx_cache = {}
@@ -549,9 +604,8 @@ class SIGMAFLIP:
         self.preload_tool_assets()
         self.create_menu_bar()
         self.build_ui()
-        self.load_user_settings() # Restores settings on boot
+        self.load_user_settings()
 
-        # Start a stable, version-independent theme polling loop
         self._last_mode = ctk.get_appearance_mode().lower()
         self.poll_appearance_mode()
         self.root.after(80, self._ui_pump)
@@ -577,18 +631,15 @@ class SIGMAFLIP:
             pass
 
     def _cleanup_audio(self) -> None:
-        """Stop pygame music, delete temp audio file, and reset audio state flags."""
         try:
             pygame.mixer.music.stop()
             pygame.mixer.music.unload()
         except Exception:
             pass
 
-        if self.temp_audio_path and os.path.exists(self.temp_audio_path):
-            try:
-                os.unlink(self.temp_audio_path)
-            except Exception:
-                pass
+        if getattr(self, "_temp_audio_dir", None):
+            shutil.rmtree(self._temp_audio_dir, ignore_errors=True)
+            self._temp_audio_dir = None
 
         self.temp_audio_path = None
         self.has_audio = False
@@ -708,10 +759,10 @@ class SIGMAFLIP:
         btn.configure(command=flash_click)
 
     def _set_window_icon(self, window, delay=True):
-        """Resolves taskbar icon mapping prioritizing the high-fidelity .ico file across execution paths."""
+        """Prefers the .ico over the .png for the taskbar icon."""
         ico_path = os.path.join(self.img_path, 'sigma.ico')
         png_path = os.path.join(self.img_path, 'sigma.png')
-        
+
         def do_set():
             try:
                 if IS_WINDOWS and os.path.exists(ico_path):
@@ -719,7 +770,7 @@ class SIGMAFLIP:
                         window.iconbitmap(ico_path)
                     except Exception as e:
                         print(f"Windows iconbitmap configuration error: {e}")
-                
+
                 best_icon_path = ico_path if os.path.exists(ico_path) else (png_path if os.path.exists(png_path) else None)
                 if best_icon_path:
                     img = Image.open(best_icon_path)
@@ -728,14 +779,13 @@ class SIGMAFLIP:
                     window._icon_img = photo
             except Exception as e:
                 print(f"Icon configuration error: {e}")
-                
+
         if delay:
             window.after(250, do_set)
         else:
             do_set()
 
     def create_menu_bar(self):
-        """Builds a native theme-integrated window menu bar with high-contrast Unicode checkmarks."""
         curr_mode = ctk.get_appearance_mode().lower()
         is_dark = curr_mode == "dark"
         menu_opts = {} if IS_MAC else dict(
@@ -744,13 +794,13 @@ class SIGMAFLIP:
             activebackground=SUB_COLOR,
             activeforeground="#111827",
             borderwidth=0, font=(self.font_family, 10))
-        
+
         self.menubar = tk.Menu(self.root, **menu_opts)
         self.root.configure(menu=self.menubar)
-        
+
         self.options_menu = tk.Menu(self.menubar, tearoff=0, **menu_opts)
         self.menubar.add_cascade(label="Options", menu=self.options_menu)
-        
+
         self.options_menu.add_command(
             label="✓ Enable Audio Preview" if self.audio_enabled else "   Enable Audio Preview",
             command=self.toggle_audio_menu_item
@@ -771,7 +821,7 @@ class SIGMAFLIP:
         self.options_menu.add_cascade(label="Export Folder Structure", menu=self.struct_menu)
 
         self.struct_menu.add_command(label="✓ Native DCIM (10XNIN01/NIN02)", command=lambda: self.set_struct_menu_type("dcim"))
-        self.struct_menu.add_command(label="   Sequential Parts (Part_X)", command=lambda: self.set_struct_menu_type("parts"))
+        self.struct_menu.add_command(label="   Sequential Parts (SFPart_X)", command=lambda: self.set_struct_menu_type("parts"))
 
         self.options_menu.add_separator()
 
@@ -787,12 +837,12 @@ class SIGMAFLIP:
             label="Advanced Settings...",
             command=self.show_advanced_settings
         )
-        
+        self.adv_menu_index = self.options_menu.index("end")
+
         self.menubar.add_command(label="Keyboard Shortcuts", command=self.show_keybinds)
         self.menubar.add_command(label="About", command=self.show_about_dialog)
 
     def toggle_audio_menu_item(self):
-        """Toggles audio state, updating high-contrast menu labels manually."""
         self.audio_enabled = not self.audio_enabled
         self.options_menu.entryconfigure(
             0,
@@ -802,9 +852,18 @@ class SIGMAFLIP:
 
     def set_bg_menu_type(self, bg_type, silent=False):
         if bg_type == "custom":
-            self.select_custom_bg_image()
-            if self.bg_type_var.get() != "custom":
-                return
+            if silent:
+                if self.bg_image_path and os.path.isfile(self.bg_image_path):
+                    self.bg_type = "custom"
+                    self.bg_type_var.set("custom")
+                else:
+                    self.bg_image_path = None
+                    self.bg_type = "black"
+                    self.bg_type_var.set("black")
+            else:
+                self.select_custom_bg_image()
+                if self.bg_type_var.get() != "custom":
+                    return
         else:
             self.bg_type = bg_type
             self.bg_type_var.set(bg_type)
@@ -822,7 +881,7 @@ class SIGMAFLIP:
             self.on_struct_type_change()
 
         self.struct_menu.entryconfigure(0, label="✓ Native DCIM (10XNIN01/NIN02)" if self.export_structure_var.get() == "dcim" else "   Native DCIM (10XNIN01/NIN02)")
-        self.struct_menu.entryconfigure(1, label="✓ Sequential Parts (Part_X)" if self.export_structure_var.get() == "parts" else "   Sequential Parts (Part_X)")
+        self.struct_menu.entryconfigure(1, label="✓ Sequential Parts (SFPart_X)" if self.export_structure_var.get() == "parts" else "   Sequential Parts (SFPart_X)")
 
     def set_console_type(self, console_type):
         self.console_type = console_type
@@ -830,6 +889,11 @@ class SIGMAFLIP:
         self.console_menu.entryconfigure(1, label="✓ Nintendo 3DS" if self.console_type == "3ds" else "   Nintendo 3DS")
 
     def _prompt_pit_deletion(self, pit):
+        if threading.current_thread() is threading.main_thread():
+            return messagebox.askyesno(
+                "Delete album cache?",
+                f"A stale photo album cache was found at:\n{pit}\n\n"
+                "Delete it now so the console re-scans the new photos?")
         result = [False]
         done = threading.Event()
         def ask():
@@ -859,7 +923,7 @@ class SIGMAFLIP:
     def _validate_still_image(self, file_path):
         try:
             if not file_path.lower().endswith(STILL_IMAGE_EXTS):
-                raise ValueError("File format not supported in Singular Image mode.")
+                raise ValueError("File format not supported in Still Images mode.")
             with Image.open(file_path) as img:
                 img.verify()
             with Image.open(file_path) as img:
@@ -875,7 +939,8 @@ class SIGMAFLIP:
             return False, str(e)
 
     def _clear_background_cache(self):
-        _BG_SRC_CACHE.clear()
+        with _CACHE_LOCK:
+            _BG_SRC_CACHE.clear()
 
     def select_custom_bg_image(self):
         file_path = filedialog.askopenfilename(
@@ -936,6 +1001,10 @@ class SIGMAFLIP:
         )
 
     def show_advanced_settings(self):
+        if getattr(self, "_adv_win", None) is not None and self._adv_win.winfo_exists():
+            self._adv_win.lift()
+            self._adv_win.focus_force()
+            return
         self.play_sound('apply.mp3')
         fonts = {
             'title': self.font_title,
@@ -946,22 +1015,23 @@ class SIGMAFLIP:
             'tiny': self.font_tiny
         }
         from sf.advanced import show_advanced_dialog
-        show_advanced_dialog(
+        self._adv_win = show_advanced_dialog(
             parent=self.root,
             fonts=fonts,
             main_color=self.main_color_adaptive,
             sub_color=self.sub_color_adaptive,
             highlight_color=self.highlight_color_adaptive,
             settings=self.advanced_settings,
-            on_change_callback=self.update_frame_display,
+            on_change_callback=self.request_preview_refresh,
             get_export_structure=lambda: self.export_structure,
             get_console_type=lambda: self.console_type,
             set_icon_fn=self._set_window_icon,
-            theme_bg=self._theme_bg
+            theme_bg=self._theme_bg,
+            get_exporting=lambda: getattr(self, "_exporting", False),
+            get_export_mode=lambda: self.export_mode_var.get()
         )
 
     def on_audio_toggle(self):
-        """Dynamically handles toggle checking and cleans/starts ffmpeg extractions actively."""
         self.play_sound('apply.mp3')
         if self.audio_enabled:
             if self.video_path and not self.has_audio and "Video" in self.export_mode_var.get():
@@ -983,13 +1053,13 @@ class SIGMAFLIP:
         try:
             menu_bg = "#2b2b2b" if new_mode == "dark" else "#ffffff"
             menu_fg = "#E2E8F0" if new_mode == "dark" else "#111827"
-            
+
             for menu in (self.options_menu, self.bg_menu, self.struct_menu, self.console_menu):
                 try:
                     menu.configure(bg=menu_bg, fg=menu_fg, activebackground=SUB_COLOR, activeforeground="#111827")
                 except Exception:
                     pass
-                    
+
             self.draw_window_grid(forced_mode=new_mode)
             if self.current_singular_view == "grid" and self.image_paths:
                 self.root.after(100, self.populate_thumbnail_grid)
@@ -1032,26 +1102,25 @@ class SIGMAFLIP:
         )
 
         self.grid_controls_row = ctk.CTkFrame(self.root, fg_color="transparent")
-        
+
         self.delete_frame_btn = ctk.CTkButton(
             self.grid_controls_row, text="Delete Selected", command=self.delete_selected_frame,
             width=110, height=28, font=self.font_tiny, fg_color="transparent", text_color="#ef4444", hover_color="#dc2626"
         )
         self.delete_frame_btn.pack(side=tk.LEFT, padx=5)
-        
+
         self.move_left_btn = ctk.CTkButton(
             self.grid_controls_row, text="Move Left", command=self.move_frame_left,
             width=80, height=28, font=self.font_tiny, fg_color="transparent", text_color=self.main_color_adaptive, hover_color=self.highlight_color_adaptive
         )
         self.move_left_btn.pack(side=tk.LEFT, padx=5)
-        
+
         self.move_right_btn = ctk.CTkButton(
             self.grid_controls_row, text="Move Right", command=self.move_frame_right,
             width=80, height=28, font=self.font_tiny, fg_color="transparent", text_color=self.main_color_adaptive, hover_color=self.highlight_color_adaptive
         )
         self.move_right_btn.pack(side=tk.LEFT, padx=5)
 
-        # Timeline Slider with precision seeking & scrub event tracking
         self.timeline_slider = ctk.CTkSlider(
             self.root, from_=0, to=100, number_of_steps=100,
             button_color=self.main_color_adaptive, button_hover_color=SUB_COLOR,
@@ -1060,7 +1129,6 @@ class SIGMAFLIP:
         self.timeline_slider.pack(fill="x", padx=40, pady=5)
         self.timeline_slider.set(0)
 
-        # Bind press and release handlers for smooth audio scrubbing and anti-stuttering
         self.timeline_slider.bind("<Button-1>", self.on_slider_press, add="+")
         self.timeline_slider.bind("<ButtonRelease-1>", self.on_slider_release, add="+")
         if hasattr(self.timeline_slider, "_canvas"):
@@ -1105,7 +1173,7 @@ class SIGMAFLIP:
 
         self.tile_config_row = ctk.CTkFrame(self.root, fg_color="transparent")
         self.tile_frame_label = ctk.CTkLabel(
-            self.tile_config_row, text="Tile Size:", 
+            self.tile_config_row, text="Tile Size:",
             font=self.font_small, text_color=self.sub_color_adaptive, fg_color="transparent"
         )
         self.tile_frame_label.pack(side=tk.LEFT, padx=(0, 5))
@@ -1167,7 +1235,7 @@ class SIGMAFLIP:
         self.config_row.pack(pady=4, fill="x", padx=45)
 
         ctk.CTkLabel(self.config_row, text="Resize:", font=self.font_small, text_color=self.sub_color_adaptive, fg_color="transparent").pack(side=tk.LEFT, padx=(0, 5))
-        
+
         self.aspect_menu = ctk.CTkOptionMenu(
             self.config_row, values=["Fit (Letterbox)", "Stretch", "Crop (4:3)", "Tiles", "Tiles Stretched"],
             command=self.set_scale_mode,
@@ -1185,7 +1253,7 @@ class SIGMAFLIP:
         ctk.CTkLabel(self.config_row, text="Mode:", font=self.font_small, text_color=self.sub_color_adaptive, fg_color="transparent").pack(side=tk.LEFT, padx=(15, 5))
         self.export_mode_var = ctk.StringVar(value="Video Frames")
         self.export_mode_menu = ctk.CTkOptionMenu(
-            self.config_row, values=["Video Frames", "Singular Image"],
+            self.config_row, values=["Video Frames", "Still Images"],
             variable=self.export_mode_var,
             fg_color=self._theme_bg,
             button_color=self._theme_bg,
@@ -1221,8 +1289,8 @@ class SIGMAFLIP:
             self.ctrl_row, text="Export Frames", command=self.export_frames,
             width=100, height=36, font=self.font_medium_bold, state="disabled",
             fg_color="transparent",
-            hover_color=self.highlight_color_adaptive, 
-            text_color=self.main_color_adaptive, 
+            hover_color=self.highlight_color_adaptive,
+            text_color=self.main_color_adaptive,
             corner_radius=8
         )
         self.export_btn.pack(side=tk.LEFT, padx=3)
@@ -1280,20 +1348,20 @@ class SIGMAFLIP:
         if cols == 1 and rows == 1:
             cols = 2
             rows = 2
-            
+
         return cols, rows
 
     def draw_window_grid(self, event=None, forced_mode=None):
         if event and event.widget != self.root:
             return
-            
+
         ww = self.root.winfo_width()
         wh = self.root.winfo_height()
         curr_mode = forced_mode if forced_mode else ctk.get_appearance_mode().lower()
-        
+
         if ww == self.last_grid_w and wh == self.last_grid_h and curr_mode == self.last_grid_mode:
             return
-            
+
         self.last_grid_w = ww
         self.last_grid_h = wh
         self.last_grid_mode = curr_mode
@@ -1312,7 +1380,7 @@ class SIGMAFLIP:
             img = Image.open(p)
             self.speed_tk_imgs[self.speed] = ImageTk.PhotoImage(img)
             self.speed_widget.create_image(0, 0, image=self.speed_tk_imgs[self.speed], anchor="nw", tags="speed_img")
-        
+
         curr_mode = ctk.get_appearance_mode().lower()
         bg_color = "#2b2b2b" if curr_mode == "dark" else "#ebebeb"
         self.speed_widget.configure(bg=bg_color)
@@ -1381,12 +1449,6 @@ class SIGMAFLIP:
         self._update_thumb_selection(old_idx, index)
         self.update_nav_buttons_state()
 
-    def double_click_grid_image(self, index):
-        self.play_sound('apply.mp3')
-        self.still_index = index
-        self.video_path = self.image_paths[self.still_index]
-        self.switch_to_preview_view()
-
     def show_grid_tooltip(self, event, filename):
         self.hide_grid_tooltip()
         self._tooltip_win = tk.Toplevel(self.root)
@@ -1394,7 +1456,7 @@ class SIGMAFLIP:
         x = event.x_root + 15
         y = event.y_root + 10
         self._tooltip_win.wm_geometry(f"+{x}+{y}")
-        
+
         lbl = tk.Label(
             self._tooltip_win,
             text=filename,
@@ -1447,10 +1509,9 @@ class SIGMAFLIP:
         cols = 3
         start = self._thumb_rendered
         end = min(self._thumb_rendered + BATCH, len(self.image_paths))
-        curr_mode = ctk.get_appearance_mode().lower()
 
         for idx in range(start, end):
-            cell = self._build_thumb_cell(idx, curr_mode, cols)
+            cell = self._build_thumb_cell(idx, cols)
             if cell:
                 self._thumb_cells[idx] = cell
 
@@ -1459,7 +1520,20 @@ class SIGMAFLIP:
         if self._thumb_rendered < len(self.image_paths):
             self._thumb_batch_id = self.root.after(50, self._thumb_render_next_batch)
 
-    def _build_thumb_cell(self, idx, curr_mode, cols):
+    def _thumb_colors(self, selected):
+        if ctk.get_appearance_mode().lower() == "light":
+            return (
+                "#e5e7eb" if selected else "#f3f4f6",
+                self.highlight_color if selected else "#e5e7eb",
+                "#111827" if selected else "#4b5563",
+            )
+        return (
+            "#2d2d2d" if selected else "#1a1a1a",
+            self.highlight_color if selected else "#1a1a1a",
+            self.main_color_adaptive[1] if selected else self.sub_color_adaptive[1],
+        )
+
+    def _build_thumb_cell(self, idx, cols):
         path = self.image_paths[idx]
         try:
             raw_img = Image.open(path)
@@ -1481,14 +1555,7 @@ class SIGMAFLIP:
             self._thumbnail_tk_images.append(tk_thumb)
 
             is_selected = (idx == self.still_index)
-            if curr_mode == "light":
-                border_clr = self.highlight_color if is_selected else "#e5e7eb"
-                bg_clr = "#e5e7eb" if is_selected else "#f3f4f6"
-                text_clr = "#111827" if is_selected else "#4b5563"
-            else:
-                border_clr = self.highlight_color if is_selected else "#1a1a1a"
-                bg_clr = "#2d2d2d" if is_selected else "#1a1a1a"
-                text_clr = self.main_color_adaptive[1] if is_selected else self.sub_color_adaptive[1]
+            bg_clr, border_clr, text_clr = self._thumb_colors(is_selected)
 
             filename = os.path.basename(path)
             display_name = filename[:9] + "..." if len(filename) > 12 else filename
@@ -1522,13 +1589,8 @@ class SIGMAFLIP:
             return None
 
     def _update_thumb_selection(self, old_idx, new_idx):
-        curr_mode = ctk.get_appearance_mode().lower()
-        if curr_mode == "light":
-            sel_bg, sel_border = "#e5e7eb", self.highlight_color
-            def_bg, def_border = "#f3f4f6", "#e5e7eb"
-        else:
-            sel_bg, sel_border = "#2d2d2d", self.highlight_color
-            def_bg, def_border = "#1a1a1a", "#1a1a1a"
+        _, def_bg, def_border = self._thumb_colors(False)
+        _, sel_bg, sel_border = self._thumb_colors(True)
 
         for idx, bg, border, thick in [
             (old_idx, def_bg, def_border, 1),
@@ -1606,10 +1668,18 @@ class SIGMAFLIP:
             self.update_nav_buttons_state()
 
     def load_user_settings(self):
-        if not os.path.exists(self.config_filepath):
+        src = self.config_filepath
+        if not os.path.exists(src) and os.path.exists(self._legacy_config_filepath):
+            src = self._legacy_config_filepath
+        if IS_LINUX and not os.path.exists(src):
+            old_linux_path = os.path.join(
+                os.path.expanduser("~"), ".config", "sigmaflip", ".sigmaflip_config.json")
+            if os.path.exists(old_linux_path):
+                src = old_linux_path
+        if not os.path.exists(src):
             return
         try:
-            with open(self.config_filepath, "r") as f:
+            with open(src, "r") as f:
                 config = json.load(f)
 
             advanced = config.get("advanced_settings", {})
@@ -1620,6 +1690,13 @@ class SIGMAFLIP:
             self.advanced_settings["black_and_white"] = bool(self.advanced_settings.get("black_and_white", False))
             self.advanced_settings["contrast"] = max(0.1, min(3.0, float(self.advanced_settings.get("contrast", 1.0))))
             self.advanced_settings["album_capacity"] = max(1, int(self.advanced_settings.get("album_capacity", 100)))
+            self.advanced_settings["jpg_quality"] = max(1, min(100, int(self.advanced_settings.get("jpg_quality", 95))))
+            self.advanced_settings["watermark_scale"] = max(5, min(100, int(self.advanced_settings.get("watermark_scale", 40))))
+            wm_path = self.advanced_settings.get("watermark_path")
+            if wm_path and not os.path.isfile(wm_path):
+                self.advanced_settings["watermark_path"] = ""
+            if self.advanced_settings.get("dither_mode") in ("Bayer 16x16", "Bayer 32x32"):
+                self.advanced_settings["dither_mode"] = "None"
 
             self.audio_enabled = config.get("audio_enabled", True)
             self.bg_type = config.get("bg_type", "black")
@@ -1628,7 +1705,7 @@ class SIGMAFLIP:
             self.console_type = config.get("console_type", "dsi")
             self.bg_type_var.set(self.bg_type)
             self.export_structure_var.set(self.export_structure)
-            
+
             self.options_menu.entryconfigure(
                 0,
                 label="✓ Enable Audio Preview" if self.audio_enabled else "   Enable Audio Preview"
@@ -1649,14 +1726,22 @@ class SIGMAFLIP:
             self.aspect_menu.set(scale_modes_map.get(self.scale_mode, "Fit (Letterbox)"))
 
             stored_mode = config.get("export_mode", "Video Frames")
+            if stored_mode == "Singular Image":
+                stored_mode = "Still Images"
             self.export_mode_var.set(stored_mode)
             self.export_mode_menu.set(stored_mode)
-            
-            if stored_mode == "Singular Image":
+
+            if stored_mode == "Still Images":
                 self.repack_singular_image_layout()
                 self.update_nav_buttons_state()
             else:
                 self.repack_video_layout()
+
+            if src == self._legacy_config_filepath:
+                try:
+                    os.remove(src)
+                except OSError:
+                    pass
 
         except Exception as e:
             print(f"Error restoring user configurations: {e}")
@@ -1761,7 +1846,7 @@ class SIGMAFLIP:
 
         self._cleanup_audio()
 
-        if value == "Singular Image":
+        if value == "Still Images":
             self.current_singular_view = "preview"
             self.toggle_view_btn.configure(text="Switch to Grid View")
             self.repack_singular_image_layout()
@@ -1780,17 +1865,17 @@ class SIGMAFLIP:
             self.export_btn.configure(text="Export Frames")
 
     def toggle_export_mode(self):
-        new_mode = "Singular Image" if self.export_mode_var.get() != "Singular Image" else "Video Frames"
+        new_mode = "Still Images" if self.export_mode_var.get() != "Still Images" else "Video Frames"
         self.export_mode_var.set(new_mode)
         self.on_export_mode_change(new_mode)
 
     def load_video_dialog(self):
         if self.playing:
             self.toggle_play()
-        
+
         self.play_sound('upload.mp3')
-        
-        if self.export_mode_var.get() == "Singular Image":
+
+        if self.export_mode_var.get() == "Still Images":
             file_paths = filedialog.askopenfilenames(
                 filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.webp")]
             )
@@ -1828,22 +1913,22 @@ class SIGMAFLIP:
             self.image_paths = valid_paths
             self.still_index = 0
             self.video_path = self.image_paths[self.still_index]
-            
+
             if len(self.image_paths) == 1:
                 self.file_name_label.configure(text=os.path.basename(self.video_path))
                 self.export_btn.configure(text="Export Frame")
             else:
                 self.file_name_label.configure(text=f"{len(self.image_paths)} Images Loaded")
                 self.export_btn.configure(text="Export Frames")
-                
+
             self.export_btn.configure(state="normal")
             self.update_nav_buttons_state()
-            
+
             if self.current_singular_view == "grid":
                 self.populate_thumbnail_grid()
             else:
                 self.update_frame_display()
-                
+
             self.check_timing_warnings(show_popup=False)
             return
 
@@ -1859,7 +1944,7 @@ class SIGMAFLIP:
             messagebox.showerror(
                 "Unsupported File",
                 "Video Frames mode accepts only videos and GIFs (MP4, AVI, MOV, MKV, GIF).\n\n"
-                "To load a still image, choose \"Singular Image\" from the Export Mode menu, then load the file again."
+                "To load a still image, choose \"Still Images\" from the Export Mode menu, then load the file again."
             )
             return
 
@@ -1905,7 +1990,7 @@ class SIGMAFLIP:
             ffmpeg = shutil.which("ffmpeg")
             if ffmpeg:
                 try:
-                    r = subprocess.run([ffmpeg, "-i", file_path], capture_output=True, text=True, creationflags=_NO_WINDOW)
+                    r = subprocess.run([ffmpeg, "-i", os.path.abspath(file_path)], capture_output=True, text=True, creationflags=_NO_WINDOW)
                     m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", r.stderr or "")
                     if m:
                         h, mi, s = m.groups()
@@ -1921,7 +2006,6 @@ class SIGMAFLIP:
         self.timeline_slider.configure(from_=0, to=max(1, self.total_video_frames - 1))
         self.timeline_slider.set(0)
 
-        # Extract audio in background if toggle is checked
         if self.audio_enabled:
             threading.Thread(target=self.extract_audio_thread, daemon=True).start()
 
@@ -1929,65 +2013,46 @@ class SIGMAFLIP:
         self.check_timing_warnings(show_popup=True)
         self.update_frame_display()
 
+    def _navigate(self, new_idx, sound):
+        if not self.image_paths:
+            return
+        old_idx = self.still_index
+        if new_idx == old_idx:
+            return
+        self.still_index = new_idx
+        self.play_sound(sound)
+        self.video_path = self.image_paths[self.still_index]
+        self.update_nav_buttons_state()
+        if self.current_singular_view == "grid":
+            self._update_thumb_selection(old_idx, self.still_index)
+        else:
+            self.update_frame_display()
+
     def show_prev_image(self):
         if self.still_index > 0:
-            old_idx = self.still_index
-            self.still_index -= 1
-            self.play_sound('prev.mp3')
-            self.video_path = self.image_paths[self.still_index]
-            self.update_nav_buttons_state()
-            if self.current_singular_view == "grid":
-                self._update_thumb_selection(old_idx, self.still_index)
-            else:
-                self.update_frame_display()
+            self._navigate(self.still_index - 1, 'prev.mp3')
 
     def show_next_image(self):
         if self.still_index < len(self.image_paths) - 1:
-            old_idx = self.still_index
-            self.still_index += 1
-            self.play_sound('next.mp3')
-            self.video_path = self.image_paths[self.still_index]
-            self.update_nav_buttons_state()
-            if self.current_singular_view == "grid":
-                self._update_thumb_selection(old_idx, self.still_index)
-            else:
-                self.update_frame_display()
+            self._navigate(self.still_index + 1, 'next.mp3')
 
     def jump_to_beginning(self):
-        if self.still_index == 0 or not self.image_paths:
-            return
-        old_idx = self.still_index
-        self.still_index = 0
-        self.play_sound('beg.mp3')
-        self.video_path = self.image_paths[0]
-        self.update_nav_buttons_state()
-        if self.current_singular_view == "grid":
-            self._update_thumb_selection(old_idx, 0)
-        else:
-            self.update_frame_display()
+        if self.image_paths and self.still_index != 0:
+            self._navigate(0, 'beg.mp3')
 
     def jump_to_end(self):
         if not self.image_paths:
             return
         last = len(self.image_paths) - 1
-        if self.still_index == last:
-            return
-        old_idx = self.still_index
-        self.still_index = last
-        self.play_sound('end.mp3')
-        self.video_path = self.image_paths[last]
-        self.update_nav_buttons_state()
-        if self.current_singular_view == "grid":
-            self._update_thumb_selection(old_idx, last)
-        else:
-            self.update_frame_display()
+        if self.still_index != last:
+            self._navigate(last, 'end.mp3')
 
     def _set_nav_btn_state(self, btn, state, icon_name):
         btn.configure(state=state, image=self.icons.get(icon_name))
 
     def update_nav_buttons_state(self):
         total = len(self.image_paths)
-        
+
         if hasattr(self, "delete_frame_btn"):
             if total <= 1:
                 self.delete_frame_btn.configure(state="disabled")
@@ -2001,28 +2066,24 @@ class SIGMAFLIP:
             self._set_nav_btn_state(self.end_btn, "disabled", 'end_disabled')
             self.nav_label.configure(text=f"1 of {total}" if total == 1 else "0 of 0")
             return
-            
+
         self.nav_label.configure(text=f"{self.still_index + 1} of {total}")
-        
-        # Beginning button
+
         if self.still_index == 0:
             self._set_nav_btn_state(self.beg_btn, "disabled", 'beg_disabled')
         else:
             self._set_nav_btn_state(self.beg_btn, "normal", 'beg')
-            
-        # Previous navigation button
+
         if self.still_index == 0:
             self._set_nav_btn_state(self.prev_btn, "disabled", 'prev_disabled')
         else:
             self._set_nav_btn_state(self.prev_btn, "normal", 'prev')
-            
-        # Next navigation button
+
         if self.still_index == total - 1:
             self._set_nav_btn_state(self.next_btn, "disabled", 'next_disabled')
         else:
             self._set_nav_btn_state(self.next_btn, "normal", 'next')
-            
-        # End button
+
         if self.still_index == total - 1:
             self._set_nav_btn_state(self.end_btn, "disabled", 'end_disabled')
         else:
@@ -2034,8 +2095,9 @@ class SIGMAFLIP:
         if not ffmpeg_bin or not self.video_path:
             return
 
-        base_tmp = os.path.join(tempfile.gettempdir(), f"sigmaflip_preview_{int(time.time())}")
-        
+        self._temp_audio_dir = tempfile.mkdtemp(prefix="sigmaflip_preview_")
+        base_tmp = os.path.join(self._temp_audio_dir, "audio")
+
         # Priority: OGG (native seek in SDL_mixer/pygame) -> MP3 -> PCM WAV fallback
         candidates = [
             (f"{base_tmp}.ogg", ["-c:a", "libvorbis", "-q:a", "4"]),
@@ -2047,7 +2109,7 @@ class SIGMAFLIP:
 
         extracted_path = None
         for path_candidate, codec_args in candidates:
-            cmd = [ffmpeg_bin, "-y", "-i", self.video_path, "-vn"] + codec_args + [path_candidate]
+            cmd = [ffmpeg_bin, "-y", "-i", os.path.abspath(self.video_path), "-vn"] + codec_args + [path_candidate]
             try:
                 res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=_NO_WINDOW)
                 if res.returncode == 0 and os.path.exists(path_candidate) and os.path.getsize(path_candidate) > 100:
@@ -2059,6 +2121,9 @@ class SIGMAFLIP:
         if extracted_path:
             self.temp_audio_path = extracted_path
             self._ui_call(self.load_extracted_audio)
+        else:
+            shutil.rmtree(self._temp_audio_dir, ignore_errors=True)
+            self._temp_audio_dir = None
 
     def load_extracted_audio(self):
         try:
@@ -2088,14 +2153,18 @@ class SIGMAFLIP:
                 pass
         return duration
 
+    def get_exact_export_frame_count(self) -> int:
+        target_fps = SPEED_FPS[self.speed]
+        dur = self.get_effective_duration()
+        return max(1, math.ceil(dur * target_fps))
+
     def check_timing_warnings(self, show_popup=False):
-        if self.export_mode_var.get() == "Singular Image":
+        if self.export_mode_var.get() == "Still Images":
             self.update_indicator_metrics(0)
             return
 
         target_fps = SPEED_FPS[self.speed]
-        effective_dur = self.get_effective_duration()
-        estimated_frames = max(1, math.ceil(effective_dur * target_fps))
+        estimated_frames = self.get_exact_export_frame_count()
 
         if show_popup and self.video_duration > WARNING_DURATION:
             self.play_sound('warning.mp3')
@@ -2104,14 +2173,14 @@ class SIGMAFLIP:
                 f"Your selected video is {self.video_duration:.1f} seconds long, which exceeds the recommended 60-second limit.\n\n"
                 "Flipnote Studio limits files to 999 frames and enforces strict per-frame memory caps "
                 "(derived from ink usage, line counts, and color complexity).\n\n"
-                f"At the chosen Speed {self.speed} ({target_fps} FPS), this will yield approximately {estimated_frames} frames.\n\n"
+                f"At the chosen Speed {self.speed} ({target_fps} FPS), this will yield exactly {estimated_frames} frames.\n\n"
                 "To avoid app crashes or failed imports, please consider trimming this video "
                 "or opting for a lower playback speed setting."
             )
         self.update_indicator_metrics(estimated_frames)
 
     def update_indicator_metrics(self, estimated_frames):
-        if self.export_mode_var.get() == "Singular Image":
+        if self.export_mode_var.get() == "Still Images":
             total_images = len(self.image_paths)
             if total_images > 1:
                 self.limit_indicator.configure(
@@ -2148,11 +2217,11 @@ class SIGMAFLIP:
             self.tile_config_row.pack_forget()
         elif value in ("Tiles", "Tiles Stretched"):
             self.scale_mode = value
-            if self.export_mode_var.get() == "Singular Image":
+            if self.export_mode_var.get() == "Still Images":
                 self.repack_singular_image_layout()
             else:
                 self.repack_video_layout()
-                
+
         if self.cap or self.image_paths:
             self.check_timing_warnings(show_popup=False)
         self.update_frame_display()
@@ -2161,12 +2230,7 @@ class SIGMAFLIP:
         if not self.video_path:
             return
 
-        is_singular = (self.export_mode_var.get() == "Singular Image")
-        
-        curr_time = time.time()
-        time_delta = curr_time - self._last_render_time
-        self._last_render_time = curr_time
-        self._rapid_rendering = (time_delta < 0.08) or self.playing
+        is_singular = (self.export_mode_var.get() == "Still Images")
 
         canvas_w = self.video_canvas.winfo_width()
         canvas_h = self.video_canvas.winfo_height()
@@ -2193,15 +2257,15 @@ class SIGMAFLIP:
         elif self.cap:
             target_frame = int(self.current_frame_idx)
             current_pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-            
+
             if target_frame != current_pos:
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-                
+
             ret, frame = self.cap.read()
             if not ret:
                 return
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_img = Image.fromarray(frame).convert("RGBA")
+            pil_img = Image.fromarray(frame)
         else:
             return
 
@@ -2211,18 +2275,26 @@ class SIGMAFLIP:
         self.video_canvas.delete("all")
         self.video_canvas.create_image(canvas_w // 2, canvas_h // 2, image=self.tk_image, anchor="center")
 
-    def apply_advanced_filters(self, img):
-        return _apply_advanced_filters_mod(img, self.advanced_settings, self._exporting, self.playing)
+    def request_preview_refresh(self):
+        if self.playing:
+            return
+        if self._preview_refresh_id is None:
+            self._preview_refresh_id = self.root.after(16, self.flush_preview_refresh)
+
+    def flush_preview_refresh(self):
+        self._preview_refresh_id = None
+        self.update_frame_display()
 
     def apply_scaling_to_image(self, img, target_w, target_h):
         return _apply_scaling_filter_mod(
             img, target_w, target_h,
             self.bg_type, self.scale_mode, self.get_grid_dimensions(),
             self.advanced_settings, self.bg_image_path,
-            self._exporting, self.playing)
+            self._exporting, self.playing,
+            os.path.join(self.img_path, "default_watermark.png"),
+            self.export_mode_var.get() != "Still Images")
 
     def on_slider_press(self, event=None):
-        """User pressed down on the seekbar slider thumb or track."""
         if not self.cap and not self.gif_img:
             return
         self._is_scrubbing = True
@@ -2234,7 +2306,6 @@ class SIGMAFLIP:
                 pass
 
     def on_slider_release(self, event=None):
-        """User released mouse button after scrubbing or clicking seekbar."""
         if not self._is_scrubbing:
             return
         self._is_scrubbing = False
@@ -2255,7 +2326,6 @@ class SIGMAFLIP:
                 pass
 
     def on_slider_scrub(self, val):
-        """Called dynamically as the user drags or repositions the timeline seekbar."""
         if not self.cap and not self.gif_img:
             return
         frame_idx = float(val)
@@ -2274,7 +2344,6 @@ class SIGMAFLIP:
             self.start_audio_at_current_frame()
 
     def start_audio_at_current_frame(self):
-        """Starts continuous audio playback at the current frame timestamp."""
         if not (self.audio_enabled and self.has_audio):
             return
         if self.video_fps <= 0:
@@ -2288,14 +2357,14 @@ class SIGMAFLIP:
             print(f"[SIGMAFLIP] Audio preview playback notice: {e}")
 
     def toggle_play(self):
-        if not self.cap or (self.export_mode_var.get() == "Singular Image"):
+        if not self.cap or (self.export_mode_var.get() == "Still Images"):
             return
 
         if self.playing:
             self.playing = False
             self.play_btn.configure(image=self.icons.get('play'))
             self.play_sound('stoppause.mp3')
-            
+
             try:
                 pygame.mixer.music.stop()
             except Exception:
@@ -2312,10 +2381,10 @@ class SIGMAFLIP:
             self.play_btn.configure(image=self.icons.get('pause'))
             self.play_sound('playresume.mp3')
             self.sync_speed_widget_image()
-            
+
             self._playback_start_time = time.perf_counter()
             self._playback_start_frame = self.current_frame_idx
-            
+
             self.start_audio_at_current_frame()
             self.playback_tick()
 
@@ -2333,7 +2402,7 @@ class SIGMAFLIP:
         target_fps = SPEED_FPS[self.speed]
         frame_step = max(1, round(self.video_fps / target_fps))
         elapsed = time.perf_counter() - self._playback_start_time
-        
+
         # High precision perf_counter ensures 1:1 sync with audio without SDL timer drift
         self.current_frame_idx = self._playback_start_frame + (elapsed * self.video_fps)
 
@@ -2375,6 +2444,15 @@ class SIGMAFLIP:
             self.timeline_slider.set(0)
             self.update_frame_display()
 
+    def _throttle(self, key, gap=0.3):
+        now = time.perf_counter()
+        last = getattr(self, "_last_key_times", {})
+        if now - last.get(key, 0.0) < gap:
+            return True
+        last[key] = now
+        self._last_key_times = last
+        return False
+
     def on_global_key(self, event):
         if getattr(self, "_exporting", False):
             return None
@@ -2386,7 +2464,7 @@ class SIGMAFLIP:
         mods = event.state
         ctrl = bool(mods & 0x4)
         shift = bool(mods & 0x1)
-        is_singular = (self.export_mode_var.get() == "Singular Image")
+        is_singular = (self.export_mode_var.get() == "Still Images")
         have_video = bool(self.cap or self.gif_img)
         ksl = ks.lower()
 
@@ -2409,19 +2487,15 @@ class SIGMAFLIP:
 
         if ks == "backslash":
             if self.scale_mode in ("Tiles", "Tiles Stretched"):
-                if time.perf_counter() - getattr(self, "_last_key_times", {}).get("backslash", 0.0) < 0.3:
+                if self._throttle("backslash"):
                     return "break"
-                self._last_key_times = getattr(self, "_last_key_times", {})
-                self._last_key_times["backslash"] = time.perf_counter()
                 self.toggle_tile_link()
                 return "break"
             return None
 
         if ks == "space":
-            if time.perf_counter() - getattr(self, "_last_key_times", {}).get("space", 0.0) < 0.3:
+            if self._throttle("space"):
                 return "break"
-            self._last_key_times = getattr(self, "_last_key_times", {})
-            self._last_key_times["space"] = time.perf_counter()
             self.toggle_play()
             return "break"
 
@@ -2478,10 +2552,8 @@ class SIGMAFLIP:
         if not have_video:
             return None
         if ksl == "k":
-            if time.perf_counter() - getattr(self, "_last_key_times", {}).get("space", 0.0) < 0.3:
+            if self._throttle("space"):
                 return "break"
-            self._last_key_times = getattr(self, "_last_key_times", {})
-            self._last_key_times["space"] = time.perf_counter()
             self.toggle_play()
             return "break"
         if ks == "Left":
@@ -2517,24 +2589,7 @@ class SIGMAFLIP:
         except Exception:
             pass
 
-        bg_canvas = tk.Canvas(win, bg="#1a1a1a", highlightthickness=0, bd=0)
-        bg_canvas.place(x=0, y=0, relwidth=1, relheight=1)
-        last_grid = {"w": 0, "h": 0}
-
-        def draw_bg(event=None):
-            try:
-                if not win.winfo_exists():
-                    return
-                w = win.winfo_width()
-                h = win.winfo_height()
-                if w == last_grid["w"] and h == last_grid["h"]:
-                    return
-                last_grid.update(w=w, h=h)
-                draw_grid_on_canvas(bg_canvas, w, h, ctk.get_appearance_mode().lower())
-            except Exception:
-                pass
-
-        win.bind("<Configure>", draw_bg)
+        attach_grid_background(win)
 
         main = self.main_color_adaptive
         sub = self.sub_color_adaptive
@@ -2562,13 +2617,13 @@ class SIGMAFLIP:
                 ("Ctrl+O/⌘+O", "Load photos/video"),
                 ("Ctrl+S/⌘+S", "Export frames"),
             ]),
-            ("SINGULAR IMAGE MODE", [
+            ("STILL IMAGES MODE", [
                 ("←/→", "Previous/next image"),
                 ("Shift+←/Shift+→", "Jump to first/last image"),
                 ("`", "Rearrange images in grid view (Enter to select, Left/Right to move)"),
             ]),
             ("OTHER", [
-                ("Ctrl+Shift+O/⌘+Shift+O", "Switch between Video Frames and Singular Image mode"),
+                ("Ctrl+Shift+O/⌘+Shift+O", "Switch between Video Frames and Still Images mode"),
                 ("\\", "Toggle tile linking"),
             ]),
         ]
@@ -2597,8 +2652,15 @@ class SIGMAFLIP:
 
         win.protocol("WM_DELETE_WINDOW", close)
 
+    def _notify_export_complete(self, title, message, directory=None):
+        if directory:
+            if messagebox.askyesno(title, message + "\n\nOpen the export folder?", parent=self.root):
+                _open_in_file_manager(directory)
+        else:
+            messagebox.showinfo(title, message, parent=self.root)
+
     def start_rearrange_mode(self):
-        if self.export_mode_var.get() != "Singular Image" or not self.image_paths:
+        if self.export_mode_var.get() != "Still Images" or not self.image_paths:
             return
         if self.current_singular_view != "grid":
             self.switch_to_grid_view()
@@ -2614,14 +2676,11 @@ class SIGMAFLIP:
         self._rearrange_grab = False
         self._update_thumb_selection(None, self.still_index)
 
-    def encode_and_sign_frame_safe(self, pil_img: Image.Image, time_str: str, target_path: str) -> bool:
-        return encode_sign_frame_mod(pil_img, time_str, target_path)
-
     def get_export_worker_count(self) -> int:
         total_cores = os.cpu_count() or 1
         if self.advanced_settings.get("performance_mode", False):
             return max(1, min(total_cores - 1, 2))
-        return max(1, total_cores)
+        return max(1, min(total_cores, 8))
 
     def set_export_priority(self, low_end_mode: bool):
         if IS_WINDOWS:
@@ -2655,7 +2714,7 @@ class SIGMAFLIP:
         for batch_label, batch in batches:
             for part_idx, chunk in enumerate([batch[i:i + 100] for i in range(0, len(batch), 100)]):
                 if use_parts:
-                    part_dir = os.path.join(output_dir, f"Part_{part_idx + 1}")
+                    part_dir = os.path.join(output_dir, f"SFPart_{part_idx + 1}")
                 else:
                     part_dir = os.path.join(output_dir, batch_label, f"{100 + part_idx}{dsi_suffix}")
                 os.makedirs(part_dir, exist_ok=True)
@@ -2668,7 +2727,7 @@ class SIGMAFLIP:
 
         if not jobs:
             return 0, folder_sets
-        total = len(jobs)
+        total_jobs = len(jobs)
 
         params = {
             "bg_type": self.bg_type,
@@ -2676,42 +2735,53 @@ class SIGMAFLIP:
             "grid_dims": self.get_grid_dimensions(),
             "advanced_settings": dict(self.advanced_settings),
             "bg_image_path": self.bg_image_path,
+            "watermark_default_path": os.path.join(self.img_path, "default_watermark.png"),
+            "allow_watermark": self.export_mode_var.get() != "Still Images",
         }
         work = [(j[0], j[1], j[2], params) for j in jobs]
 
         def _report(done):
-            self._ui_call(lambda p=p_start + p_span * (done / max(1, total)): self.progress_bar.set(p))
+            self._ui_call(lambda p=p_start + p_span * (done / max(1, total_jobs)): self.progress_bar.set(p))
 
         pool = None
         is_low_end_mode = bool(self.advanced_settings.get("performance_mode", False))
         self.set_export_priority(low_end_mode=is_low_end_mode)
         try:
             try:
-                from concurrent.futures import ProcessPoolExecutor
-                pool = ProcessPoolExecutor(max_workers=self.get_export_worker_count())
+                from concurrent.futures import ThreadPoolExecutor
+                pool = ThreadPoolExecutor(max_workers=self.get_export_worker_count())
             except Exception as e:
-                print(f"[SIGMAFLIP] Multiprocessing unavailable, falling back to single-process export: {e}")
+                print(f"[SIGMAFLIP] Thread pool unavailable, falling back to single-process export: {e}")
 
+            done = 0
             signed_count = 0
             if pool is not None:
                 try:
+                    from concurrent.futures import as_completed
+                    futures = {pool.submit(_process_and_sign_job, w): w for w in work}
                     done = 0
-                    for ok in pool.map(_process_and_sign_job, work, chunksize=4):
+                    for fut in as_completed(futures):
+                        try:
+                            ok = fut.result()
+                        except Exception:
+                            ok = False
                         if ok:
                             signed_count += 1
                         done += 1
                         _report(done)
                 except Exception as e:
-                    print(f"[SIGMAFLIP] Multiprocessing export failed, falling back to single-process export: {e}")
+                    print(f"[SIGMAFLIP] Threaded export failed, falling back to single-process export: {e}")
                     pool.shutdown()
                     pool = None
 
             if pool is None:
-                for i, job in enumerate(work):
-                    ok = _process_and_sign_job(job)
+                done = 0
+                for w in work:
+                    ok = _process_and_sign_job(w)
                     if ok:
                         signed_count += 1
-                    _report(i + 1)
+                    done += 1
+                    _report(done)
         finally:
             self.set_export_priority(low_end_mode=False)
 
@@ -2728,19 +2798,72 @@ class SIGMAFLIP:
 
         return signed_count, folder_sets
 
-    def run_batch_image_export_pipeline(self, output_dir: str) -> None:
+    def _commit_staged_export(self, staging_dir, final_dir):
+        try:
+            entries = os.listdir(staging_dir) if os.path.isdir(staging_dir) else []
+            if not entries:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                return ""
+            os.makedirs(final_dir, exist_ok=True)
+            shutil.copytree(staging_dir, final_dir, dirs_exist_ok=True)
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            return ""
+        except Exception as e:
+            self._ui_call(lambda err=e: messagebox.showerror(
+                "Export Finalize Failure",
+                f"Export finished, but the files could not be moved into:\n{final_dir}\n\n{err}\n\n"
+                f"They remain in the temporary folder:\n{staging_dir}"
+            ))
+            return ""
+
+    def _handle_existing_images_backup(self, target_dir):
+        try:
+            entries = [e for e in os.listdir(target_dir)
+                       if e == "DCIM" or e.startswith("DCIM_") or e.startswith("SFPart_")]
+        except OSError:
+            entries = []
+        if not entries:
+            return True, ""
+        if not messagebox.askyesno(
+            "Existing Export Folders Found",
+            f"The destination folder contains {len(entries)} previous export folder(s) "
+            f"({', '.join(entries)}).\n\n"
+            "Move them into a backup subfolder before exporting?",
+            parent=self.root
+        ):
+            self.play_sound('back.mp3')
+            return False, ""
+        backup_dir = os.path.join(target_dir, f"_SIGMAFLIP_exportbackup_{time.strftime('%Y%m%d_%H%M%S')}")
+        try:
+            os.makedirs(backup_dir, exist_ok=True)
+            for e in entries:
+                shutil.move(os.path.join(target_dir, e), os.path.join(backup_dir, e))
+        except Exception as ex:
+            self.play_sound('warning.mp3')
+            messagebox.showerror(
+                "Backup Failed",
+                f"Previous export folders could not be moved into a backup folder:\n{ex}\n\nExport cancelled.",
+                parent=self.root
+            )
+            return False, ""
+        self.play_sound('apply.mp3')
+        return True, f"\n\n{len(entries)} previous export folder(s) were moved into:\n{backup_dir}"
+
+    def run_batch_image_export_pipeline(self, output_dir: str, final_dir: str) -> None:
         try:
             self._exporting = True
             base_time = time.time()
             signed_count, folder_sets = self._sign_and_partition(
                 output_dir, self.image_paths, base_time, remove_sources=False)
 
-            self._ui_call(lambda: self.play_sound('apply.mp3'))
-            cache_note = self._cleanup_dsi_album_cache(output_dir) if self.console_type == "dsi" else ""
-            self._ui_call(lambda note=cache_note: messagebox.showinfo(
-                "Export Complete", 
-                f"Successfully formatted, signed, and grouped {signed_count} still images into selected directory layout!"
-                + note
+            self._ui_call(lambda: self.play_sound('save.mp3'))
+            self._commit_staged_export(output_dir, final_dir)
+            cache_note = self._cleanup_dsi_album_cache(final_dir) if self.console_type == "dsi" else ""
+            shown_dir = final_dir
+            self._ui_call(lambda c=signed_count, note=cache_note, d=shown_dir, bk=getattr(self, "_export_backup_note", ""): self._notify_export_complete(
+                "Export Complete",
+                f"Successfully formatted, signed, and grouped {c} still images into selected directory layout!"
+                + "\n\nFiles were moved into your selected folder." + bk + note, d
             ))
         except Exception as e:
             self._ui_call(lambda: self.play_sound('warning.mp3'))
@@ -2749,6 +2872,7 @@ class SIGMAFLIP:
             self._exporting = False
             self._ui_call(lambda: self.toggle_widgets_interactive_state(enabled=True))
             self._ui_call(lambda: self.progress_bar.set(1.0))
+            self._ui_call(lambda: self.update_frame_display())
 
     def export_frames(self) -> None:
         if not self.video_path and not self.image_paths:
@@ -2756,21 +2880,25 @@ class SIGMAFLIP:
         if self.playing:
             self.toggle_play()
 
-        if self.export_mode_var.get() == "Singular Image":
+        if self.export_mode_var.get() == "Still Images":
             if not self.image_paths:
                 return
 
             if len(self.image_paths) > 1:
-                target_dir = filedialog.askdirectory(title="Select Folder to Save Signed JPEGs")
-                if not target_dir:
+                final_dir = filedialog.askdirectory(title="Select Folder to Save Signed JPEGs")
+                if not final_dir:
                     self.play_sound('back.mp3')
                     return
-                
+                ok, bknote = self._handle_existing_images_backup(final_dir)
+                if not ok:
+                    return
+                self._export_backup_note = bknote
+                staging_dir = tempfile.mkdtemp(prefix="sigmaflip_export_")
                 self.progress_bar.set(0)
                 self.toggle_widgets_interactive_state(enabled=False)
                 threading.Thread(
-                    target=self.run_batch_image_export_pipeline, 
-                    args=(target_dir,), 
+                    target=self.run_batch_image_export_pipeline,
+                    args=(staging_dir, final_dir),
                     daemon=True
                 ).start()
                 return
@@ -2785,6 +2913,11 @@ class SIGMAFLIP:
                 self.play_sound('back.mp3')
                 return
 
+            ok, bknote = self._handle_existing_images_backup(os.path.dirname(target_file))
+            if not ok:
+                return
+            self._export_backup_note = bknote
+
             try:
                 self._exporting = True
                 pil_img = Image.open(self.video_path).convert("RGBA")
@@ -2792,12 +2925,17 @@ class SIGMAFLIP:
                 pil_img.info.clear()
 
                 time_str = time.strftime("%Y:%m:%d %H:%M:%S", time.localtime())
-                self.encode_and_sign_frame_safe(pil_img, time_str, target_file)
+                encode_sign_frame_mod(pil_img, time_str, target_file)
 
                 os.utime(target_file, (time.time(), time.time()))
                 self.play_sound('apply.mp3')
                 console_name = "Nintendo DSi" if self.console_type == "dsi" else "Nintendo 3DS"
-                messagebox.showinfo("Export Complete", f"Successfully exported, timestamped, and signed still image for {console_name}!")
+                self._notify_export_complete(
+                    "Export Complete",
+                    f"Successfully exported, timestamped, and signed still image for {console_name}!"
+                    + getattr(self, "_export_backup_note", ""),
+                    os.path.dirname(target_file)
+                )
             except Exception as e:
                 self.play_sound('warning.mp3')
                 messagebox.showerror("Export Failure", f"Failed to export still image:\n{str(e)}")
@@ -2805,12 +2943,14 @@ class SIGMAFLIP:
                 self._exporting = False
             return
 
-        target_fps = SPEED_FPS[self.speed]
-        target_dir = filedialog.askdirectory(title="Choose Output Export Directory")
-        if not target_dir:
+        final_dir = filedialog.askdirectory(title="Choose Output Export Directory")
+        if not final_dir:
             self.play_sound('back.mp3')
             return
-
+        ok, bknote = self._handle_existing_images_backup(final_dir)
+        if not ok:
+            return
+        self._export_backup_note = bknote
         ffmpeg_bin = shutil.which("ffmpeg")
         if not ffmpeg_bin:
             self.play_sound('warning.mp3')
@@ -2819,36 +2959,35 @@ class SIGMAFLIP:
             )
             return
 
+        staging_dir = tempfile.mkdtemp(prefix="sigmaflip_export_")
         self.progress_bar.set(0)
         self.toggle_widgets_interactive_state(enabled=False)
 
         export_bg_type = self.bg_type_var.get()
         export_thread = threading.Thread(
             target=self.run_ffmpeg_export_pipeline,
-            args=(target_dir, ffmpeg_bin, export_bg_type),
+            args=(staging_dir, final_dir, ffmpeg_bin, export_bg_type),
             daemon=True
         )
         export_thread.start()
 
-    def run_ffmpeg_export_pipeline(self, output_dir: str, ffmpeg_path: str, bg_type: str = "black") -> None:
+    def run_ffmpeg_export_pipeline(self, output_dir: str, final_dir: str, ffmpeg_path: str, bg_type: str = "black") -> None:
         target_fps = SPEED_FPS[self.speed]
-        effective_dur = self.get_effective_duration()
-        frame_limit = max(1, math.ceil(effective_dur * target_fps))
+        exact_frames = self.get_exact_export_frame_count()
 
         temp_dir = tempfile.mkdtemp(prefix="sigmaflip_export_")
         temp_pattern = os.path.join(temp_dir, "frame_%05d.png")
 
         cmd = [
-            ffmpeg_path, "-y", "-i", self.video_path,
-            "-vf", f"fps={target_fps}:round=up",
-            "-frames:v", str(frame_limit),
+            ffmpeg_path, "-y", "-i", os.path.abspath(self.video_path),
+            "-vf", f"fps=fps={target_fps}:round=near,tpad=stop_mode=clone:stop=-1",
+            "-frames:v", str(exact_frames),
             "-an", temp_pattern
         ]
 
         try:
             self._exporting = True
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, creationflags=_NO_WINDOW)
-            expected_frames = frame_limit
             stderr_tail = []
             while True:
                 line = process.stderr.readline()
@@ -2860,7 +2999,7 @@ class SIGMAFLIP:
                     try:
                         parts = line.split("frame=")[1].strip().split()
                         curr_exported_frame = int(parts[0])
-                        progress_val = min(0.5, (curr_exported_frame / max(1, expected_frames)) * 0.5)
+                        progress_val = min(0.05, (curr_exported_frame / max(1, exact_frames)) * 0.05)
                         self._ui_call(lambda p=progress_val: self.progress_bar.set(p))
                     except Exception:
                         pass
@@ -2871,20 +3010,33 @@ class SIGMAFLIP:
                 if f.lower().endswith(".png")
             ]) if os.path.isdir(temp_dir) else []
 
+            if temp_filenames and len(temp_filenames) < exact_frames:
+                last_file = os.path.join(temp_dir, temp_filenames[-1])
+                for pad_idx in range(len(temp_filenames) + 1, exact_frames + 1):
+                    pad_name = f"frame_{pad_idx:05d}.png"
+                    if not os.path.exists(os.path.join(temp_dir, pad_name)):
+                        shutil.copy2(last_file, os.path.join(temp_dir, pad_name))
+                temp_filenames = sorted([
+                    f for f in os.listdir(temp_dir)
+                    if f.lower().endswith(".png")
+                ])
+
             if process.returncode == 0 and temp_filenames:
                 self._ui_call(lambda: self.file_name_label.configure(text="Timestamping, Signing & Splitting...", text_color=MAIN_COLOR))
 
                 base_time = time.time()
                 sources = [os.path.join(temp_dir, f) for f in temp_filenames]
                 signed_count, folder_sets = self._sign_and_partition(
-                    output_dir, sources, base_time, remove_sources=False, progress_range=(0.5, 1.0))
+                    output_dir, sources, base_time, remove_sources=False, progress_range=(0.05, 1.0))
 
-                self._ui_call(lambda: self.play_sound('apply.mp3'))
+                self._ui_call(lambda: self.play_sound('save.mp3'))
                 self._ui_call(lambda: self.file_name_label.configure(text=os.path.basename(self.video_path), text_color=SUB_COLOR))
-                cache_note = self._cleanup_dsi_album_cache(output_dir) if self.console_type == "dsi" else ""
-                self._ui_call(lambda c=signed_count, p=folder_sets, note=cache_note: messagebox.showinfo(
+                self._commit_staged_export(output_dir, final_dir)
+                cache_note = self._cleanup_dsi_album_cache(final_dir) if self.console_type == "dsi" else ""
+                shown_dir = final_dir
+                self._ui_call(lambda c=signed_count, p=folder_sets, note=cache_note, d=shown_dir, bk=getattr(self, "_export_backup_note", ""): self._notify_export_complete(
                     "Export Complete", f"Successfully exported, timestamped, and signed {c} frames grouped into {p} folder sets!"
-                    + note
+                    + "\n\nFiles were moved into your selected folder." + bk + note, d
                 ))
             else:
                 detail = "No frames were written." if process.returncode == 0 else f"FFmpeg returned code {process.returncode}."
@@ -2898,11 +3050,13 @@ class SIGMAFLIP:
             shutil.rmtree(temp_dir, ignore_errors=True)
             self._ui_call(lambda: self.toggle_widgets_interactive_state(enabled=True))
             self._ui_call(lambda: self.progress_bar.set(1.0))
+            self._ui_call(lambda: self.update_frame_display())
 
     def toggle_widgets_interactive_state(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
+        self.options_menu.entryconfigure(self.adv_menu_index, state=state)
         self.load_btn.configure(state=state, image=self.icons.get('upload' if enabled else 'upload_disabled'))
-        if self.export_mode_var.get() == "Singular Image":
+        if self.export_mode_var.get() == "Still Images":
             self.play_btn.configure(state="disabled")
         else:
             self.play_btn.configure(state=state, image=self.icons.get('play' if enabled else 'play_disabled'))
@@ -2922,6 +3076,8 @@ class SIGMAFLIP:
             self.tile_cols_entry.configure(state=state)
         if hasattr(self, 'tile_rows_entry'):
             self.tile_rows_entry.configure(state=state)
+        if hasattr(self, 'timeline_slider'):
+            self.timeline_slider.configure(state=state)
         self.sync_speed_widget_image(enabled and not self.playing)
 
     def on_close(self) -> None:
@@ -2933,7 +3089,9 @@ class SIGMAFLIP:
             self.gif_img.close()
         if self.after_play_id:
             self.root.after_cancel(self.after_play_id)
-            
+        if self._preview_refresh_id:
+            self.root.after_cancel(self._preview_refresh_id)
+
         self.save_user_settings()
         self.purge_pycache_directories()
         self.root.destroy()
