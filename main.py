@@ -11,11 +11,12 @@ if platform.system() == "Windows":
         except Exception:
             pass
 
-from sf.app import SIGMAFLIP
+from sf.app import SIGMAFLIP, purge_orphaned_export_dirs
 
 def main():
     from multiprocessing import freeze_support
     freeze_support()
+    purge_orphaned_export_dirs()
     root = ctk.CTk()
     app = SIGMAFLIP(root)
     root.mainloop()
