@@ -37,14 +37,14 @@ The DCIM structure for the 3DS is very much the same as the DSi, just different 
 | Video support? | ❌ | ✔ |
 | File Format | JPEG only | PNG, JPEG/JPG, WEBP, BMP (Still Images) MP4 AVI MOV MKV GIF (Video Frames)|
 | Last Activity | around 2019 to 2022 | 2026 and beyond (until I say so) |
-| Other known features | Resizing, widecut, and proportionate images, DPI optimization | More resizing options such as title layout, additional filters, black/white/custom backgrounds, display inversion, DCIM tree or Part_X tree exporting layouts, 3DS support, pit.bin deletion/detection confirmation, video export watermark|
+| Other known features | Resizing, widecut, and proportionate images, DPI optimization | More resizing options such as title layout, additional filters, black/white/custom backgrounds, display inversion, DCIM tree or SFPart_X tree exporting layouts, 3DS support, pit.bin deletion/detection confirmation, video export watermark|
 
 *Works natively under Wine <br />
 **Desktop only
 
 ## What you need (for manually executing):
 - Latest Python recommended, at least Python 3.10 for it's minimum
-- The latest version of FFmpeg recommended too
+- FFmpeg
 
 ### Manual execution
 #### By manually running, be sure to keep the assets folder in the same directory as the main.py script, or else you will encounter errors. <br>
