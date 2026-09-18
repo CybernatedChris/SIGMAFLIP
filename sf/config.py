@@ -1,10 +1,23 @@
-# sf/config.py
 import os
-import sys
+import atexit
 import platform
 import subprocess
+import tkinter as tk
 import tkinter.font as tkfont
 import shutil
+
+import customtkinter as ctk
+
+_COPIED_FONTS = []
+
+def _purge_copied_fonts():
+    for p in _COPIED_FONTS:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+atexit.register(_purge_copied_fonts)
 
 SYSTEM = platform.system()
 IS_WINDOWS = SYSTEM == "Windows"
@@ -20,32 +33,12 @@ except ImportError:
 os.environ.setdefault('SDL_VIDEODRIVER', 'dummy')
 os.environ.setdefault('PYGAME_HIDE_SUPPORT_PROMPT', '1')
 
-# Sleek Stealth Slate Color Palette
-MAIN_COLOR = "#E2E8F0"  # Bright Titanium Platinum (dark mode)
-SUB_COLOR = "#64748B"   # Tactical Cool Slate Gray
+MAIN_COLOR = "#E2E8F0"
+SUB_COLOR = "#64748B"
 MAX_FRAMES = 999
 SPEED_FPS = {1: 0.5, 2: 1, 3: 2, 4: 4, 5: 6, 6: 12, 7: 20, 8: 30}
-VERSION = "v1.3"
+VERSION = "v1.3.1"
 WARNING_DURATION = 60.0
-
-def get_resource_path(relative_path):
-    # Resolves directly to the package environment level
-    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, relative_path)
-
-def get_icon_path(img_dir, name):
-    order = [f"{name}.ico", f"{name}.png"] if IS_WINDOWS else [f"{name}.png", f"{name}.ico"]
-    for f in order:
-        p = os.path.join(img_dir, f)
-        if os.path.exists(p):
-            return p
-    return None
-
-def safe_relpath(target, start):
-    try:
-        return os.path.relpath(target, start)
-    except ValueError:
-        return os.path.abspath(target)
 
 def extract_font_family(font_path):
     if HAS_FONTTOOLS:
@@ -100,16 +93,18 @@ def load_custom_font(root, font_path):
                 dest = os.path.expanduser(f"~/Library/Fonts/{os.path.basename(font_path)}")
                 if not os.path.exists(dest):
                     shutil.copy2(font_path, dest)
+                    _COPIED_FONTS.append(dest)
         except Exception:
             return fallback
     elif IS_LINUX:
         try:
-            d = os.path.expanduser("~/.local/share/fonts")
+            d = os.path.join(os.path.expanduser("~/.local/share/fonts"), "sigmaflip")
             os.makedirs(d, exist_ok=True)
             dest = os.path.join(d, os.path.basename(font_path))
             if not os.path.exists(dest):
-                    shutil.copy2(font_path, dest)
-                    subprocess.run(["fc-cache", "-f"], capture_output=True)
+                shutil.copy2(font_path, dest)
+                _COPIED_FONTS.append(dest)
+                subprocess.run(["fc-cache", d], capture_output=True, timeout=20)
         except Exception:
             return fallback
 
@@ -141,3 +136,25 @@ def draw_grid_on_canvas(canvas, width, height, mode):
     for y in range(0, height, grid_spacing):
         canvas.create_line(0, y, width, y, fill=line_color, width=1)
     canvas.tk.call('lower', canvas._w)
+
+
+def attach_grid_background(window, bg_color="#1a1a1a"):
+    """Attaches a themed 10px grid canvas that redraws on window resize."""
+    canvas = tk.Canvas(window, bg=bg_color, highlightthickness=0, bd=0)
+    canvas.place(x=0, y=0, relwidth=1, relheight=1)
+    last_grid = {"w": 0, "h": 0}
+
+    def draw_bg(event=None):
+        try:
+            if not window.winfo_exists():
+                return
+            w = window.winfo_width()
+            h = window.winfo_height()
+            if w == last_grid["w"] and h == last_grid["h"]:
+                return
+            last_grid.update(w=w, h=h)
+            draw_grid_on_canvas(canvas, w, h, ctk.get_appearance_mode().lower())
+        except Exception:
+            pass
+
+    window.bind("<Configure>", draw_bg)
