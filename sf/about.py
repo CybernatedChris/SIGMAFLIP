@@ -1,36 +1,23 @@
-# sf/about.py
 import os
 import customtkinter as ctk
 import tkinter as tk
 from PIL import Image
-from sf.config import draw_grid_on_canvas, VERSION
+from sf.config import attach_grid_background, VERSION
 
 def show_about_dialog(parent, fonts, icon_path, main_color, sub_color, highlight_color, set_icon_fn):
-    """Generates a styled, centered About window with transparent grid backgrounds."""
     about = ctk.CTkToplevel(parent)
     about.title("About SIGMAFLIP")
     about.geometry("440x580")
     about.resizable(False, False)
     about.transient(parent)
     about.grab_set()
-    
+
     theme_bg = ("#f3f4f6", "#151515")
     about.configure(fg_color=theme_bg)
-    
+
     set_icon_fn(about, delay=True)
 
-    bg_canvas = tk.Canvas(about, bg="#1a1a1a", highlightthickness=0, bd=0)
-    bg_canvas.place(x=0, y=0, relwidth=1, relheight=1)
-
-    last_grid = {"w": 0, "h": 0}
-    def draw_bg(event=None):
-        w = about.winfo_width()
-        h = about.winfo_height()
-        if w == last_grid["w"] and h == last_grid["h"]:
-            return
-        last_grid.update(w=w, h=h)
-        draw_grid_on_canvas(bg_canvas, w, h, ctk.get_appearance_mode().lower())
-    about.bind("<Configure>", draw_bg)
+    attach_grid_background(about)
 
     frame = ctk.CTkFrame(about, fg_color="transparent")
     frame.pack(fill=tk.BOTH, expand=True, padx=25, pady=20)
@@ -46,9 +33,9 @@ def show_about_dialog(parent, fonts, icon_path, main_color, sub_color, highlight
             print(f"About image rendering error: {e}")
 
     ctk.CTkLabel(
-        frame, 
-        text="SIGMAFLIP", 
-        font=fonts['title'], 
+        frame,
+        text="SIGMAFLIP",
+        font=fonts['title'],
         text_color=main_color,
         fg_color="transparent"
     ).pack(pady=(0, 5))
@@ -59,13 +46,13 @@ def show_about_dialog(parent, fonts, icon_path, main_color, sub_color, highlight
         "Slopped by CybernatedChris\n"
         "Powered by dsi_jpeg_signature_tool by NrNbaYoh"
     )
-    
+
     ctk.CTkLabel(
-        frame, 
-        text=body_text, 
-        font=fonts['small'], 
-        text_color=main_color, 
-        wraplength=380, 
+        frame,
+        text=body_text,
+        font=fonts['small'],
+        text_color=main_color,
+        wraplength=380,
         justify="center",
         fg_color="transparent"
     ).pack(pady=5)
@@ -105,9 +92,9 @@ def show_about_dialog(parent, fonts, icon_path, main_color, sub_color, highlight
     ).pack(padx=10, pady=8)
 
     ctk.CTkLabel(
-        frame, 
+        frame,
         text=VERSION,
-        font=fonts['tiny'], 
+        font=fonts['tiny'],
         text_color=sub_color,
         fg_color="transparent"
     ).pack(side=tk.BOTTOM, pady=(5, 0))
