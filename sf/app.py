@@ -11,6 +11,7 @@ import tempfile
 import math
 import struct
 import re
+import numpy as np
 import cv2
 import pygame
 import tkinter as tk
@@ -22,11 +23,11 @@ Image.MAX_IMAGE_PIXELS = 100_000_000
 from sf.config import (
     IS_WINDOWS, IS_MAC, IS_LINUX, MAIN_COLOR, SUB_COLOR,
     MAX_FRAMES, SPEED_FPS, load_custom_font, WARNING_DURATION,
-    draw_grid_on_canvas, attach_grid_background
+    attach_grid_background, nine_slice, GridLabel, symbol_font
 )
 from sf.about import show_about_dialog
 from sf.dither import (apply_ordered_dither, apply_error_diffusion,
-                        apply_dot_diffusion, apply_riemersma, apply_woodcut)
+                        apply_dot_diffusion, apply_riemersma, apply_woodcut, warmup)
 
 if IS_WINDOWS:
     import ctypes
@@ -59,14 +60,181 @@ VIDEO_EXTS = (".mp4", ".avi", ".mov", ".mkv", ".gif")
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+_PREVIEW_MAX_W = 640
+_FAST_FORWARD_MAX = 200
+_REWIND_TOLERANCE = 2
+
+
+class FFmpegVideoCapture:
+    """Frame source that decodes through the system FFmpeg instead of OpenCV's bundled build.
+
+    OpenCV's Linux wheels ship no software AV1 decoder, so cv2.VideoCapture opens such a
+    file, reports a frame count, then fails every read(). FFmpeg is already a hard
+    dependency here (export and audio) and is kept current by the OS, so decoding through
+    it keeps preview working for every codec the system supports.
+
+    Mimics the sliver of the cv2.VideoCapture API the app uses: get/set on
+    CAP_PROP_POS_FRAMES, CAP_PROP_FPS, CAP_PROP_FRAME_COUNT, read() returning a BGR array,
+    and release(). Sequential reads stream from one long-lived process; any seek restarts
+    FFmpeg at that frame."""
+
+    def __init__(self, path):
+        self.path = os.path.abspath(path)
+        self.fps, self.frame_count, self.w, self.h = self._probe()
+        self.out_w, self.out_h = self._preview_dims()
+        self._next = 0
+        self._proc = None
+
+    def _probe(self):
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            return 0.0, 0, 0, 0
+        cmd = [ffprobe, "-v", "error", "-select_streams", "v:0",
+               "-show_entries", "stream=width,height,r_frame_rate,nb_frames:format=duration",
+               "-of", "json", self.path]
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True,
+                                 creationflags=_NO_WINDOW).stdout
+            data = json.loads(out or "{}")
+        except Exception:
+            return 0.0, 0, 0, 0
+        stream = (data.get("streams") or [{}])[0]
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+        fps = 0.0
+        try:
+            num, den = (stream.get("r_frame_rate") or "0/1").split("/")
+            if float(den):
+                fps = float(num) / float(den)
+        except Exception:
+            fps = 0.0
+        try:
+            frame_count = int(stream.get("nb_frames"))
+        except (TypeError, ValueError):
+            frame_count = 0
+        if frame_count <= 0 and fps > 0:
+            duration = float((data.get("format") or {}).get("duration") or 0.0)
+            frame_count = int(round(duration * fps))
+        return fps, frame_count, width, height
+
+    def _preview_dims(self):
+        """Source dims capped at _PREVIEW_MAX_W, aspect kept, even for the encoder.
+
+        Computed here rather than left to ffmpeg's scale expressions so the output
+        size is known in Python: read() must know exactly how many raw bytes a frame
+        is, and a mismatch would desync the pipe."""
+        if self.w <= 0 or self.h <= 0 or self.w <= _PREVIEW_MAX_W:
+            return self.w, self.h
+        out_w = _PREVIEW_MAX_W - (_PREVIEW_MAX_W % 2)
+        out_h = int(round(self.h * out_w / self.w))
+        out_h -= out_h % 2
+        return out_w, max(out_h, 2)
+
+    def isOpened(self):
+        return bool(self.w and self.h)
+
+    def _kill(self):
+        if self._proc is not None:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+            try:
+                self._proc.stdout.close()
+            except Exception:
+                pass
+            self._proc = None
+
+    def _spawn(self):
+        self._kill()
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            return
+        fps = self.fps or 24.0
+        args = [ffmpeg, "-loglevel", "error", "-ss", f"{self._next / fps:.6f}",
+                "-i", self.path]
+        if (self.out_w, self.out_h) != (self.w, self.h):
+            args += ["-vf", f"scale={self.out_w}:{self.out_h}"]
+        args += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-an", "-sn", "-"]
+        self._proc = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+            creationflags=_NO_WINDOW)
+
+    def get(self, prop):
+        if prop == cv2.CAP_PROP_POS_FRAMES:
+            return float(self._next)
+        if prop == cv2.CAP_PROP_FPS:
+            return float(self.fps)
+        if prop == cv2.CAP_PROP_FRAME_COUNT:
+            return float(self.frame_count)
+        return 0.0
+
+    def _read_exact(self, num_bytes):
+        """Pull exactly one frame's worth of bytes off the pipe.
+
+        A frame boundary is only valid if every byte of the frame is consumed, so this
+        loops until `num_bytes` are assembled and returns None on EOF. BufferedReader
+        normally delivers a full read in one go; assembling here keeps the boundary
+        correct even if the stream ever hands back a partial chunk, and it is what lets
+        read() distinguish a real end-of-stream from a truncated frame."""
+        chunks = []
+        remaining = num_bytes
+        while remaining > 0:
+            chunk = self._proc.stdout.read(remaining)
+            if not chunk:
+                return None
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def set(self, prop, value):
+        if prop == cv2.CAP_PROP_POS_FRAMES:
+            value = max(0, int(value))
+            gap = value - self._next
+            if self._proc is not None and 0 < gap <= _FAST_FORWARD_MAX:
+                self._discard(gap)
+            elif self._proc is not None and -_REWIND_TOLERANCE <= gap < 0:
+                pass
+            elif gap != 0:
+                self._next = value
+                self._kill()
+        return True
+
+    def _discard(self, count):
+        """Drop `count` frames off the live pipe without restarting FFmpeg."""
+        frame_bytes = self.out_w * self.out_h * 3
+        for _ in range(count):
+            if self._read_exact(frame_bytes) is None:
+                self._kill()
+                return
+            self._next += 1
+
+    def read(self):
+        if not self.isOpened():
+            return False, None
+        if self._proc is None:
+            self._spawn()
+            if self._proc is None:
+                return False, None
+        buf = self._read_exact(self.out_w * self.out_h * 3)
+        if buf is None:
+            self._kill()
+            return False, None
+        frame = np.frombuffer(buf, dtype=np.uint8).reshape(self.out_h, self.out_w, 3)
+        self._next += 1
+        return True, frame
+
+    def release(self):
+        self._kill()
+
+
 def _user_config_dir():
     if IS_WINDOWS:
         return os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "SIGMAFLIP")
     if IS_MAC:
         return os.path.join(os.path.expanduser("~"), "Library", "Application Support", "SIGMAFLIP")
     return os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config", "SIGMAFLIP")
-
-# Shared pipeline at module level (thread-safe, avoids per-process imports)
 
 DSI_JPEG_KEY = bytes.fromhex("70885206DFE5016D45EAC52333D6446F")
 
@@ -195,7 +363,8 @@ def build_dsi_exif_mod(time_str: str, thumb_jpeg: bytes) -> bytes:
         be32(72) + be32(1) + be32(72) + be32(1) +
         thumb_jpeg
     )
-    assert len(tiff) == 0x23C + len(thumb_jpeg)
+    if len(tiff) != 0x23C + len(thumb_jpeg):
+        raise ValueError("DSi EXIF block size mismatch")
     payload = b"Exif\x00\x00" + tiff
     return be16(len(payload) + 2) + payload
 
@@ -220,8 +389,6 @@ def encode_sign_frame_mod(pil_img: Image.Image, time_str: str, target_path: str,
                 break
             curr_q -= 10
 
-        if signed_data is None:
-            return False
         with open(target_path, "wb") as f:
             f.write(signed_data)
         return len(signed_data) <= MAX_FILE_SIZE
@@ -278,7 +445,6 @@ def _load_custom_background_mod(path, size, resample):
 
 
 def purge_orphaned_export_dirs(max_age_hours=24):
-    # age guard so a live export from another instance is not clobbered
     tmp_root = tempfile.gettempdir()
     cutoff = time.time() - max_age_hours * 3600
     try:
@@ -353,10 +519,12 @@ def _apply_scaling_filter_mod(img, target_w, target_h, bg_type, scale_mode, grid
     else:
         render_w, render_h = target_w, target_h
 
-    if advanced_settings.get("performance_mode", False):
-        scale_resample = Image.Resampling.BILINEAR
-    elif exporting:
-        scale_resample = Image.Resampling.LANCZOS
+    if exporting:
+        scale_resample = (Image.Resampling.BILINEAR
+                          if advanced_settings.get("performance_mode", False)
+                          else Image.Resampling.LANCZOS)
+    elif perf_mode:
+        scale_resample = Image.Resampling.NEAREST
     else:
         scale_resample = Image.Resampling.BOX
 
@@ -498,7 +666,7 @@ class SIGMAFLIP:
 
         self.validate_assets()
 
-        self.icon_path = os.path.join(self.img_path, 'sigma.ico')
+        self.icon_path = os.path.join(self.img_path, 'sigmoid.ico')
         self._set_window_icon(self.root, delay=True)
 
         font_file = os.path.join(self.assets_path, "font.otf")
@@ -546,13 +714,9 @@ class SIGMAFLIP:
         self._preview_refresh_id = None
         self.speed_tk_imgs = {}
 
-        self.last_grid_w = 0
-        self.last_grid_h = 0
-        self.last_grid_mode = None
-
         self._exporting = False
 
-        self.current_singular_view = "preview"  # "preview" or "grid"
+        self.current_singular_view = "preview"
         self._thumbnail_tk_images = []
         self._tooltip_win = None
         self._rearrange_mode = False
@@ -568,9 +732,11 @@ class SIGMAFLIP:
 
         self.bg_type_var = tk.StringVar(value="black")
         self.export_structure_var = tk.StringVar(value="dcim")
+        self.console_type_var = tk.StringVar(value="dsi")
         self.export_mode_var = ctk.StringVar(value="Video Frames")
 
         self.audio_enabled = True
+        self.continuous_export = False
         self.bg_type = "black"
         self.export_structure = "dcim"
         self.console_type = "dsi"
@@ -605,6 +771,9 @@ class SIGMAFLIP:
         self.create_menu_bar()
         self.build_ui()
         self.load_user_settings()
+        self.redraw_grid()
+
+        self.root.after(1000, lambda: threading.Thread(target=warmup, daemon=True).start())
 
         self._last_mode = ctk.get_appearance_mode().lower()
         self.poll_appearance_mode()
@@ -626,7 +795,7 @@ class SIGMAFLIP:
         except queue.Empty:
             pass
         try:
-            self.root.after(80, self._ui_pump)
+            self.root.after(20, self._ui_pump)
         except Exception:
             pass
 
@@ -699,28 +868,155 @@ class SIGMAFLIP:
             except Exception:
                 pass
 
+    SPRITE_HOVER_LIFT = 0.18
+
+    TEXT_FACE_TINT_DOWN = (11, 21, 35)
+
+    FACE_FILES = {"face": "buttonborder.png", "face_down": "buttonborderdown.png"}
+
+    ICON_FILES = [
+        ('play', 'play.png', 'play_down.png', 'play_disabled.png'),
+        ('pause', 'pause.png', 'pause_down.png', None),
+        ('upload', 'upload.png', 'upload_down.png', 'upload_disabled.png'),
+        ('prev', 'prevframe.png', 'prevframe_down.png', 'prevframe_disabled.png'),
+        ('next', 'nextframe.png', 'nextframe_down.png', 'nextframe_disabled.png'),
+        ('beg', 'beg.png', 'beg_down.png', 'beg_disabled.png'),
+        ('end', 'end.png', 'end_down.png', 'end_disabled.png'),
+        ('lock', 'lock.png', 'lock_down.png', 'lock_disabled.png'),
+        ('unlock', 'unlock.png', 'unlock_down.png', 'unlock_disabled.png'),
+    ]
+
+    def _load_face(self, fname):
+        p = os.path.join(self.img_path, fname)
+        return Image.open(p).convert("RGBA") if os.path.exists(p) else None
+
+    def _sprite(self, fname, lift=None):
+        """An original button sprite at the row's scale. `lift` blends toward white, which
+        is how hover brightens."""
+        p = os.path.join(self.img_path, fname)
+        if not os.path.exists(p):
+            return None
+        with Image.open(p) as raw:
+            img = raw.convert("RGBA")
+        size = (max(1, int(img.width * self.icon_scale)),
+                max(1, int(img.height * self.icon_scale)))
+        img = img.resize(size, Image.Resampling.LANCZOS)
+        if lift:
+            img = Image.blend(img, Image.new("RGBA", img.size, (255, 255, 255, 255)), lift)
+        return img
+
+    def _face_fill(self, src):
+        r, g, b, _ = src.getpixel((src.width // 2, src.height // 2))
+        return self._hex((r, g, b))
+
+    @staticmethod
+    def _hex(rgb):
+        return "#%02X%02X%02X" % tuple(rgb)
+
     def preload_tool_assets(self):
-        icon_scale = 0.55
+        self.icon_scale = 0.55
         self.icons = {}
-        for k, fname in [
-            ('play', 'play.png'), ('play_down', 'play_down.png'), ('play_disabled', 'play_disabled.png'),
-            ('pause', 'pause.png'), ('pause_down', 'pause_down.png'),
-            ('upload', 'upload.png'), ('upload_down', 'upload_down.png'), ('upload_disabled', 'upload_disabled.png'),
-            ('prev', 'prevframe.png'), ('prev_down', 'prevframe_down.png'), ('prev_disabled', 'prevframe_disabled.png'),
-            ('next', 'nextframe.png'), ('next_down', 'nextframe_down.png'), ('next_disabled', 'nextframe_disabled.png'),
-            ('beg', 'beg.png'), ('beg_down', 'beg_down.png'), ('beg_disabled', 'beg_disabled.png'),
-            ('end', 'end.png'), ('end_down', 'end_down.png'), ('end_disabled', 'end_disabled.png'),
-            ('lock', 'lock.png'), ('lock_down', 'lock_down.png'), ('lock_disabled', 'lock_disabled.png'), ('unlock', 'unlock.png'), ('unlock_down', 'unlock_down.png'), ('unlock_disabled', 'unlock_disabled.png')
-        ]:
-            p = os.path.join(self.img_path, fname)
-            if os.path.exists(p):
-                img = Image.open(p)
-                self.icons[k] = ctk.CTkImage(
-                    light_image=img, dark_image=img,
-                    size=(int(img.width * icon_scale), int(img.height * icon_scale))
-                )
-            else:
-                self.icons[k] = None
+        face = self._load_face(self.FACE_FILES["face"])
+        face_down = self._load_face(self.FACE_FILES["face_down"])
+        white = Image.new("RGBA", face.size, (255, 255, 255, 255)) if face else None
+        face_hover = Image.blend(face, white, self.SPRITE_HOVER_LIFT) if face is not None else None
+        self._face_src = {"face": face, "face_down": face_down, "face_hover": face_hover}
+        self._face_photos = {}
+
+        for key, base_f, down_f, off_f in self.ICON_FILES:
+            states = {
+                "": self._sprite(base_f),
+                "_hover": self._sprite(base_f, self.SPRITE_HOVER_LIFT),
+                "_down": self._sprite(down_f) if down_f else None,
+                "_disabled": self._sprite(off_f) if off_f else None,
+            }
+            states = self._normalize_sprite_states(states)
+            for suffix, img in states.items():
+                self.icons[key + suffix] = (
+                    ctk.CTkImage(light_image=img, dark_image=img, size=img.size) if img else None)
+
+    @staticmethod
+    def _pad_sprite(img, w, h):
+        """Centre a sprite on a transparent canvas of the given size."""
+        if img.width == w and img.height == h:
+            return img
+        canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        canvas.paste(img, ((w - img.width) // 2, (h - img.height) // 2), img)
+        return canvas
+
+    @classmethod
+    def _normalize_sprite_states(cls, states):
+        """Pads every state of one icon to a single size. CTk grows a button to fit its
+        image, so if the pressed sprite is a pixel wider than the idle one the button
+        changes width on click; padding each state to the largest removes that."""
+        sizes = [(img.width, img.height) for img in states.values() if img]
+        if not sizes:
+            return states
+        w = max(s[0] for s in sizes)
+        h = max(s[1] for s in sizes)
+        return {suf: (cls._pad_sprite(img, w, h) if img else None)
+                for suf, img in states.items()}
+
+    def _raw_bind(self, widget, sequence, func):
+        """CTkButton.bind() forwards to _canvas/_text_label/_image_label, but those are
+        siblings rather than a chain, and _image_label does not exist yet when a button is
+        created without an image. Bind the widget's own window so crossing events from
+        anything inside it are caught."""
+        tk.Misc.bind(widget, sequence, func, add="+")
+
+    def _swap_face_icon(self, btn, down):
+        """down=True shows the pressed sprite; otherwise hover shows the brightened one.
+        A disabled button keeps its muted sprite either way."""
+        base = getattr(btn, "_sf_base", None)
+        if not base:
+            return
+        disabled = btn.cget("state") == "disabled"
+        if down and disabled:
+            return
+        if disabled:
+            key = f"{base}_disabled"
+        elif down:
+            key = f"{base}_down"
+        elif getattr(btn, "_sf_hover", False):
+            key = f"{base}_hover"
+        else:
+            key = base
+        img = self.icons.get(key)
+        if img is not None and btn.cget("image") is not img:
+            btn.configure(image=img)
+
+    def _set_icon(self, btn, base, state=None):
+        """The single place a button's sprite is assigned, so hover and press can restore
+        it. `base` is always the normal-state key; the disabled sprite is derived.
+        Every configure repaints the whole button, so a write is skipped when it would not
+        change anything: nav buttons were repainting three times per page move, even when
+        their state held, which is the flicker seen going to the next frame."""
+        btn._sf_base = base
+        if state is not None and btn.cget("state") != state:
+            btn.configure(state=state)
+        key = f"{base}_disabled" if btn.cget("state") == "disabled" else base
+        img = self.icons.get(key)
+        if img is not None and btn.cget("image") is not img:
+            btn.configure(image=img)
+        self._swap_face_icon(btn, False)
+
+    def bind_hover_face(self, btn):
+        def hover(event=None):
+            btn._sf_hover = True
+            self._swap_face_icon(btn, False)
+
+        def leave(event=None):
+            btn._sf_hover = False
+            self._swap_face_icon(btn, False)
+
+        self._raw_bind(btn, "<Enter>", hover)
+        self._raw_bind(btn, "<Leave>", leave)
+
+    def _init_icon_btn(self, btn, base, state=None):
+        """Give a freshly built sprite button its base key, press flash and hover."""
+        self._set_icon(btn, base, state)
+        self.add_press_feedback(btn)
+        self.bind_hover_face(btn)
 
     def add_press_feedback(self, btn):
         """Flashes matching _down variant for ~120ms, then runs the button's command."""
@@ -732,25 +1028,13 @@ class SIGMAFLIP:
                     orig_command()
                 return
 
-            cur = btn.cget("image")
-            down_img = None
-            orig_base = None
-            for base, img in self.icons.items():
-                if img is cur and not base.endswith("_down") and not base.endswith("_disabled"):
-                    down_img = self.icons.get(f"{base}_down")
-                    orig_base = base
-                    break
-
-            btn._sf_flashing = True
+            down_img = self.icons.get(f"{getattr(btn, '_sf_base', '')}_down")
             if down_img:
                 btn.configure(image=down_img)
 
             def finish_flash():
-                btn._sf_flashing = False
-                if btn.cget("state") != "disabled" and orig_base:
-                    base_img = self.icons.get(orig_base)
-                    if base_img:
-                        btn.configure(image=base_img)
+                if down_img and btn.cget("image") is down_img:
+                    self._swap_face_icon(btn, False)
                 if orig_command:
                     orig_command()
 
@@ -758,10 +1042,108 @@ class SIGMAFLIP:
 
         btn.configure(command=flash_click)
 
+    def _face_for_state(self, btn, state):
+        """Returns the cache key, face art and label colour for the button's state."""
+        key = ("face_down" if state["down"]
+               else "face_hover" if state["hover"] else "face")
+        src = self._face_src.get(key) or self._face_src["face"]
+        if src is None:
+            return key, None, None
+        if state["down"]:
+            fg = self._hex(self.TEXT_FACE_TINT_DOWN)
+        elif btn._state == "disabled":
+            fg = btn._apply_appearance_mode(btn._text_color_disabled)
+        else:
+            fg = btn._apply_appearance_mode(btn._text_color)
+        return key, src, fg
+
+    @staticmethod
+    def _patch_text_label_bg(label):
+        """CTk resets _text_label's background and foreground on every redraw and on every
+        crossing event, and its <Enter>/<Leave> bindings were compiled at __init__, so
+        swapping the method afterwards changes nothing. Drop `bg`/`fg` from that label's
+        configure so only the caller decides its colours; otherwise the box over the text
+        comes back on hover."""
+        original = label.configure
+        label.configure = lambda *a, **kw: original(
+            *a, **{k: v for k, v in kw.items() if k not in ("bg", "fg")})
+        return original
+
+    def _bind_face_events(self, btn, state, apply):
+        def press(event=None):
+            state["down"] = True
+            apply()
+            if getattr(btn, "_face_reset_id", None):
+                btn.after_cancel(btn._face_reset_id)
+            btn._face_reset_id = btn.after(150, release)
+
+        def release(event=None):
+            btn._face_reset_id = None
+            state["down"] = False
+            apply()
+
+        def enter(event=None):
+            state["hover"] = True
+            apply()
+
+        def leave(event=None):
+            state["hover"] = False
+            apply()
+
+        def moved(event=None):
+            pos = (event.widget.winfo_rootx(), event.widget.winfo_rooty()) if event else None
+            if pos == state["moved"]:
+                return
+            state["moved"] = pos
+            apply()
+
+        base_draw = btn._draw
+
+        def draw(*args, **kwargs):
+            base_draw(*args, **kwargs)
+            apply()
+
+        btn._draw = draw
+        btn.bind("<Button-1>", press, add="+")
+        btn.bind("<ButtonRelease-1>", release, add="+")
+        btn.bind("<Configure>", apply, add="+")
+        self._raw_bind(btn, "<Enter>", enter)
+        self._raw_bind(btn, "<Leave>", leave)
+        self._raw_bind(btn, "<Configure>", moved)
+        btn.after(80, apply)
+        btn._sf_face = True
+
+    def stamp_text_face(self, btn):
+        """Text buttons have no image slot, so the border art goes on their own canvas.
+        buttonborderdown is the pressed face; hover lifts the face toward white."""
+        state = {"down": False, "hover": False, "moved": False}
+        set_label_bg = self._patch_text_label_bg(btn._text_label)
+
+        def apply(event=None):
+            c = getattr(btn, "_canvas", None)
+            w, h = btn.winfo_width(), btn.winfo_height()
+            if c is None or w <= 1 or h <= 1:
+                return
+            key, src, fg = self._face_for_state(btn, state)
+            if src is None:
+                return
+            pkey = (key, w, h)
+            photo = self._face_photos.get(pkey)
+            if photo is None:
+                photo = ImageTk.PhotoImage(nine_slice(src, (w, h)))
+                self._face_photos[pkey] = photo
+            set_label_bg(bg=self._face_fill(src), fg=fg)
+            c.delete("face")
+            c.create_image(0, 0, image=photo, anchor="nw", tags="face")
+            if c.find_withtag("border_parts"):
+                c.tag_raise("border_parts")
+
+        self._bind_face_events(btn, state, apply)
+
     def _set_window_icon(self, window, delay=True):
         """Prefers the .ico over the .png for the taskbar icon."""
-        ico_path = os.path.join(self.img_path, 'sigma.ico')
-        png_path = os.path.join(self.img_path, 'sigma.png')
+        ico_path = os.path.join(self.img_path, 'sigmoid.ico')
+        png_path = os.path.join(self.img_path, 'sigmoid.png')
 
         def do_set():
             try:
@@ -786,69 +1168,89 @@ class SIGMAFLIP:
             do_set()
 
     def create_menu_bar(self):
-        curr_mode = ctk.get_appearance_mode().lower()
-        is_dark = curr_mode == "dark"
-        menu_opts = {} if IS_MAC else dict(
-            bg="#1a1a1a" if is_dark else "#ffffff",
-            fg=MAIN_COLOR if is_dark else "#111827",
-            activebackground=SUB_COLOR,
-            activeforeground="#111827",
-            borderwidth=0, font=(self.font_family, 10))
+        menu_font = (self.font_family, -12)
 
-        self.menubar = tk.Menu(self.root, **menu_opts)
+        self.menubar = tk.Menu(self.root, font=menu_font)
         self.root.configure(menu=self.menubar)
 
-        self.options_menu = tk.Menu(self.menubar, tearoff=0, **menu_opts)
+        self.options_menu = tk.Menu(self.menubar, tearoff=0, font=menu_font)
         self.menubar.add_cascade(label="Options", menu=self.options_menu)
 
-        self.options_menu.add_command(
-            label="✓ Enable Audio Preview" if self.audio_enabled else "   Enable Audio Preview",
-            command=self.toggle_audio_menu_item
-        )
+        self.audio_menu_var = tk.BooleanVar(value=self.audio_enabled)
+        self.options_menu.add_checkbutton(label="Enable Audio Preview",
+                                          variable=self.audio_menu_var,
+                                          command=self.toggle_audio_menu_item)
 
         self.options_menu.add_separator()
 
-        self.bg_menu = tk.Menu(self.options_menu, tearoff=0, **menu_opts)
+        self.bg_menu = tk.Menu(self.options_menu, tearoff=0, font=menu_font)
         self.options_menu.add_cascade(label="Background Setting", menu=self.bg_menu)
 
-        self.bg_menu.add_command(label="✓ Solid Black", command=lambda: self.set_bg_menu_type("black"))
-        self.bg_menu.add_command(label="   Solid White", command=lambda: self.set_bg_menu_type("white"))
-        self.bg_menu.add_command(label="   Custom Background...", command=lambda: self.set_bg_menu_type("custom"))
+        self.bg_menu.add_radiobutton(label="Solid Black", variable=self.bg_type_var, value="black",
+                                     command=lambda: self.set_bg_menu_type("black"))
+        self.bg_menu.add_radiobutton(label="Solid White", variable=self.bg_type_var, value="white",
+                                     command=lambda: self.set_bg_menu_type("white"))
+        self.bg_menu.add_radiobutton(label="Custom Background...", variable=self.bg_type_var, value="custom",
+                                     command=lambda: self.set_bg_menu_type("custom"))
 
         self.options_menu.add_separator()
 
-        self.struct_menu = tk.Menu(self.options_menu, tearoff=0, **menu_opts)
+        self.struct_menu = tk.Menu(self.options_menu, tearoff=0, font=menu_font)
         self.options_menu.add_cascade(label="Export Folder Structure", menu=self.struct_menu)
 
-        self.struct_menu.add_command(label="✓ Native DCIM (10XNIN01/NIN02)", command=lambda: self.set_struct_menu_type("dcim"))
-        self.struct_menu.add_command(label="   Sequential Parts (SFPart_X)", command=lambda: self.set_struct_menu_type("parts"))
+        self.struct_menu.add_radiobutton(label="Native DCIM (10XNIN01/NIN02)", variable=self.export_structure_var, value="dcim",
+                                         command=lambda: self.set_struct_menu_type("dcim"))
+        self.struct_menu.add_radiobutton(label="Sequential Parts (SFPart_X)", variable=self.export_structure_var, value="parts",
+                                         command=lambda: self.set_struct_menu_type("parts"))
 
         self.options_menu.add_separator()
 
-        self.console_menu = tk.Menu(self.options_menu, tearoff=0, **menu_opts)
+        self.console_menu = tk.Menu(self.options_menu, tearoff=0, font=menu_font)
         self.options_menu.add_cascade(label="Target Console", menu=self.console_menu)
 
-        self.console_menu.add_command(label="✓ Nintendo DSi", command=lambda: self.set_console_type("dsi"))
-        self.console_menu.add_command(label="   Nintendo 3DS", command=lambda: self.set_console_type("3ds"))
+        self.console_menu.add_radiobutton(label="Nintendo DSi", variable=self.console_type_var, value="dsi",
+                                          command=lambda: self.set_console_type("dsi"))
+        self.console_menu.add_radiobutton(label="Nintendo 3DS", variable=self.console_type_var, value="3ds",
+                                          command=lambda: self.set_console_type("3ds"))
 
         self.options_menu.add_separator()
 
-        self.options_menu.add_command(
-            label="Advanced Settings...",
-            command=self.show_advanced_settings
-        )
+        self.continuous_export_var = tk.BooleanVar(value=self.continuous_export)
+        self.options_menu.add_checkbutton(label="Continuous Export",
+                                          variable=self.continuous_export_var,
+                                          command=self.toggle_continuous_export_menu_item)
+
+        self.options_menu.add_command(label="Advanced Settings...", command=self.show_advanced_settings)
         self.adv_menu_index = self.options_menu.index("end")
 
         self.menubar.add_command(label="Keyboard Shortcuts", command=self.show_keybinds)
         self.menubar.add_command(label="About", command=self.show_about_dialog)
 
+        self._theme_menus()
+
+    def _theme_menus(self):
+        dark = ctk.get_appearance_mode().lower() == "dark"
+        klof = dict(
+            bg="#1f1f1f" if dark else "#ffffff",
+            fg="#E8E8E8" if dark else "#111827",
+            activebackground="#3d4a5d" if dark else "#e2e8f0",
+            activeforeground="#ffffff" if dark else "#111827",
+            borderwidth=1)
+        klof["selectcolor"] = "#d0d0d0" if dark else "#111827"
+        for menu in (self.menubar, self.options_menu,
+                     self.bg_menu, self.struct_menu, self.console_menu):
+            try:
+                menu.configure(font=(self.font_family, -12), **klof)
+            except Exception:
+                pass
+
     def toggle_audio_menu_item(self):
-        self.audio_enabled = not self.audio_enabled
-        self.options_menu.entryconfigure(
-            0,
-            label="✓ Enable Audio Preview" if self.audio_enabled else "   Enable Audio Preview"
-        )
+        self.audio_enabled = self.audio_menu_var.get()
         self.on_audio_toggle()
+
+    def toggle_continuous_export_menu_item(self):
+        self.continuous_export = self.continuous_export_var.get()
+        self.play_sound('apply.mp3')
 
     def set_bg_menu_type(self, bg_type, silent=False):
         if bg_type == "custom":
@@ -870,23 +1272,15 @@ class SIGMAFLIP:
             if not silent:
                 self.on_bg_type_change()
 
-        self.bg_menu.entryconfigure(0, label="✓ Solid Black" if self.bg_type_var.get() == "black" else "   Solid Black")
-        self.bg_menu.entryconfigure(1, label="✓ Solid White" if self.bg_type_var.get() == "white" else "   Solid White")
-        self.bg_menu.entryconfigure(2, label="✓ Custom Background..." if self.bg_type_var.get() == "custom" else "   Custom Background...")
-
     def set_struct_menu_type(self, struct_type, silent=False):
         self.export_structure = struct_type
         self.export_structure_var.set(struct_type)
         if not silent:
             self.on_struct_type_change()
 
-        self.struct_menu.entryconfigure(0, label="✓ Native DCIM (10XNIN01/NIN02)" if self.export_structure_var.get() == "dcim" else "   Native DCIM (10XNIN01/NIN02)")
-        self.struct_menu.entryconfigure(1, label="✓ Sequential Parts (SFPart_X)" if self.export_structure_var.get() == "parts" else "   Sequential Parts (SFPart_X)")
-
     def set_console_type(self, console_type):
         self.console_type = console_type
-        self.console_menu.entryconfigure(0, label="✓ Nintendo DSi" if self.console_type == "dsi" else "   Nintendo DSi")
-        self.console_menu.entryconfigure(1, label="✓ Nintendo 3DS" if self.console_type == "3ds" else "   Nintendo 3DS")
+        self.console_type_var.set(console_type)
 
     def _prompt_pit_deletion(self, pit):
         if threading.current_thread() is threading.main_thread():
@@ -905,7 +1299,8 @@ class SIGMAFLIP:
             finally:
                 done.set()
         self._ui_call(ask)
-        done.wait()
+        if not done.wait(30):
+            return False
         return result[0]
 
     def _cleanup_dsi_album_cache(self, export_dir):
@@ -938,10 +1333,6 @@ class SIGMAFLIP:
         except Exception as e:
             return False, str(e)
 
-    def _clear_background_cache(self):
-        with _CACHE_LOCK:
-            _BG_SRC_CACHE.clear()
-
     def select_custom_bg_image(self):
         file_path = filedialog.askopenfilename(
             title="Select Custom Background Frame Image",
@@ -957,7 +1348,8 @@ class SIGMAFLIP:
                     "Your current background setting has been kept unchanged."
                 )
                 return
-            self._clear_background_cache()
+            with _CACHE_LOCK:
+                _BG_SRC_CACHE.clear()
             self.bg_image_path = file_path
             self.bg_type = "custom"
             self.bg_type_var.set("custom")
@@ -982,7 +1374,6 @@ class SIGMAFLIP:
             self.check_timing_warnings(show_popup=False)
 
     def show_about_dialog(self):
-        self.play_sound('apply.mp3')
         fonts = {
             'title': self.font_title,
             'large': self.font_large,
@@ -996,7 +1387,6 @@ class SIGMAFLIP:
             icon_path=self.icon_path,
             main_color=self.main_color_adaptive,
             sub_color=self.sub_color_adaptive,
-            highlight_color=self.highlight_color_adaptive,
             set_icon_fn=self._set_window_icon
         )
 
@@ -1051,41 +1441,34 @@ class SIGMAFLIP:
 
     def on_appearance_mode_changed(self, new_mode):
         try:
-            menu_bg = "#2b2b2b" if new_mode == "dark" else "#ffffff"
-            menu_fg = "#E2E8F0" if new_mode == "dark" else "#111827"
-
-            for menu in (self.options_menu, self.bg_menu, self.struct_menu, self.console_menu):
-                try:
-                    menu.configure(bg=menu_bg, fg=menu_fg, activebackground=SUB_COLOR, activeforeground="#111827")
-                except Exception:
-                    pass
-
-            self.draw_window_grid(forced_mode=new_mode)
+            self._theme_menus()
+            self.redraw_grid()
+            adv_redraw = getattr(getattr(self, "_adv_win", None), "_adv_grid_redraw", None)
+            if adv_redraw is not None:
+                adv_redraw()
             if self.current_singular_view == "grid" and self.image_paths:
                 self.root.after(100, self.populate_thumbnail_grid)
         except Exception:
             pass
 
     def build_ui(self):
-        self.bg_canvas = tk.Canvas(self.root, bg="#1a1a1a", highlightthickness=0, bd=0)
-        self.bg_canvas.place(x=0, y=0, relwidth=1, relheight=1)
-        self.root.bind("<Configure>", self.draw_window_grid)
+        self.redraw_grid = attach_grid_background(self.root)
         self.root.bind_all("<Key>", self.on_global_key)
 
         top_frame = ctk.CTkFrame(self.root, fg_color="transparent")
         top_frame.pack(fill="x", pady=5)
 
-        self.title_label = ctk.CTkLabel(
+        self.title_label = GridLabel(
             top_frame, text="SIGMAFLIP", font=self.font_title, text_color=self.main_color_adaptive, fg_color="transparent"
         )
         self.title_label.pack()
 
-        self.file_name_label = ctk.CTkLabel(
+        self.file_name_label = GridLabel(
             top_frame, text="No Video Loaded", font=self.font_tiny, text_color=self.sub_color_adaptive, fg_color="transparent"
         )
         self.file_name_label.pack()
 
-        self.preview_frame = ctk.CTkFrame(self.preview_frame if hasattr(self, 'preview_frame') else self.root, width=320, height=240, fg_color="black", border_width=2, border_color=MAIN_COLOR)
+        self.preview_frame = ctk.CTkFrame(self.preview_frame if hasattr(self, 'preview_frame') else self.root, width=320, height=240, fg_color="black", border_width=2, border_color=("#cbd5e1", "#E2E8F0"))
         self.preview_frame.pack(pady=5)
         self.preview_frame.pack_propagate(False)
 
@@ -1098,28 +1481,35 @@ class SIGMAFLIP:
 
         self.toggle_view_btn = ctk.CTkButton(
             self.root, text="Switch to Grid View", command=self.toggle_singular_view_mode,
-            width=150, height=30, font=self.font_tiny, fg_color="transparent", text_color=self.main_color_adaptive, hover_color=self.highlight_color_adaptive
+            width=150, height=32, font=self.font_tiny,
+            text_color=self.main_color_adaptive
         )
+        self.stamp_text_face(self.toggle_view_btn)
 
         self.grid_controls_row = ctk.CTkFrame(self.root, fg_color="transparent")
-
         self.delete_frame_btn = ctk.CTkButton(
             self.grid_controls_row, text="Delete Selected", command=self.delete_selected_frame,
-            width=110, height=28, font=self.font_tiny, fg_color="transparent", text_color="#ef4444", hover_color="#dc2626"
+            width=132, height=32, font=self.font_tiny,
+            text_color=self.main_color_adaptive
         )
         self.delete_frame_btn.pack(side=tk.LEFT, padx=5)
+        self.stamp_text_face(self.delete_frame_btn)
 
         self.move_left_btn = ctk.CTkButton(
             self.grid_controls_row, text="Move Left", command=self.move_frame_left,
-            width=80, height=28, font=self.font_tiny, fg_color="transparent", text_color=self.main_color_adaptive, hover_color=self.highlight_color_adaptive
+            width=92, height=32, font=self.font_tiny,
+            text_color=self.main_color_adaptive
         )
         self.move_left_btn.pack(side=tk.LEFT, padx=5)
+        self.stamp_text_face(self.move_left_btn)
 
         self.move_right_btn = ctk.CTkButton(
             self.grid_controls_row, text="Move Right", command=self.move_frame_right,
-            width=80, height=28, font=self.font_tiny, fg_color="transparent", text_color=self.main_color_adaptive, hover_color=self.highlight_color_adaptive
+            width=92, height=32, font=self.font_tiny,
+            text_color=self.main_color_adaptive
         )
         self.move_right_btn.pack(side=tk.LEFT, padx=5)
+        self.stamp_text_face(self.move_right_btn)
 
         self.timeline_slider = ctk.CTkSlider(
             self.root, from_=0, to=100, number_of_steps=100,
@@ -1136,23 +1526,23 @@ class SIGMAFLIP:
             self.timeline_slider._canvas.bind("<ButtonRelease-1>", self.on_slider_release, add="+")
 
         self.nav_row = ctk.CTkFrame(self.root, fg_color="transparent")
-        btn_defaults = dict(hover_color=self.highlight_color_adaptive, corner_radius=8, fg_color="transparent")
+        btn_defaults = dict(hover_color=self._theme_bg, corner_radius=8, fg_color="transparent")
 
         self.beg_btn = ctk.CTkButton(
             self.nav_row, text="", width=40, height=36,
             command=self.jump_to_beginning, **btn_defaults
         )
         self.beg_btn.pack(side=tk.LEFT, padx=5)
-        self.add_press_feedback(self.beg_btn)
+        self._init_icon_btn(self.beg_btn, 'beg')
 
         self.prev_btn = ctk.CTkButton(
             self.nav_row, text="", width=40, height=36,
             command=self.show_prev_image, **btn_defaults
         )
         self.prev_btn.pack(side=tk.LEFT, padx=5)
-        self.add_press_feedback(self.prev_btn)
+        self._init_icon_btn(self.prev_btn, 'prev')
 
-        self.nav_label = ctk.CTkLabel(
+        self.nav_label = GridLabel(
             self.nav_row, text="0 of 0", font=self.font_small, text_color=self.sub_color_adaptive, fg_color="transparent"
         )
         self.nav_label.pack(side=tk.LEFT, padx=5)
@@ -1162,17 +1552,17 @@ class SIGMAFLIP:
             command=self.show_next_image, **btn_defaults
         )
         self.next_btn.pack(side=tk.LEFT, padx=5)
-        self.add_press_feedback(self.next_btn)
+        self._init_icon_btn(self.next_btn, 'next')
 
         self.end_btn = ctk.CTkButton(
             self.nav_row, text="", width=40, height=36,
             command=self.jump_to_end, **btn_defaults
         )
         self.end_btn.pack(side=tk.LEFT, padx=5)
-        self.add_press_feedback(self.end_btn)
+        self._init_icon_btn(self.end_btn, 'end')
 
         self.tile_config_row = ctk.CTkFrame(self.root, fg_color="transparent")
-        self.tile_frame_label = ctk.CTkLabel(
+        self.tile_frame_label = GridLabel(
             self.tile_config_row, text="Tile Size:",
             font=self.font_small, text_color=self.sub_color_adaptive, fg_color="transparent"
         )
@@ -1186,7 +1576,7 @@ class SIGMAFLIP:
         self.tile_cols_entry.pack(side=tk.LEFT, padx=5)
         self.tile_cols_entry.bind("<KeyRelease>", self.on_grid_entry_change)
 
-        self.tile_x_label = ctk.CTkLabel(
+        self.tile_x_label = GridLabel(
             self.tile_config_row, text="x",
             font=self.font_small, text_color=self.sub_color_adaptive, fg_color="transparent"
         )
@@ -1201,16 +1591,16 @@ class SIGMAFLIP:
 
         self.tile_link_locked = False
         self.tile_link_btn = ctk.CTkButton(
-            self.tile_config_row, text="", width=32, height=28,
+            self.tile_config_row, text="", width=32, height=30,
             command=self.toggle_tile_link,
-            fg_color="transparent", hover_color=self.highlight_color_adaptive,
+            fg_color="transparent", hover_color=self._theme_bg,
             image=self.icons.get('unlock'), corner_radius=4
         )
         self.tile_link_btn.pack(side=tk.LEFT, padx=(5, 0))
-        self.add_press_feedback(self.tile_link_btn)
+        self._init_icon_btn(self.tile_link_btn, 'unlock')
         self.tile_rows_entry.bind("<KeyRelease>", self.on_grid_entry_change)
 
-        self.limit_indicator = ctk.CTkLabel(
+        self.limit_indicator = GridLabel(
             self.root, text="Export Frames: 0 / 999", font=self.font_small, text_color=self.sub_color_adaptive, fg_color="transparent"
         )
         self.limit_indicator.pack(pady=3)
@@ -1226,7 +1616,7 @@ class SIGMAFLIP:
             self.speed_h = img_sample.height
 
         self.speed_widget = tk.Canvas(self.sf_frame, width=self.speed_w, height=self.speed_h,
-                                      bg="#2b2b2b", highlightthickness=0, bd=0, cursor="hand2")
+                                      bg=("#f3f4f6" if ctk.get_appearance_mode().lower() == "light" else "#151515"), highlightthickness=0, bd=0, cursor="hand2")
         self.speed_widget.pack(pady=2)
         self.speed_widget.bind("<Button-1>", self.on_speed_widget_click)
         self.sync_speed_widget_image()
@@ -1234,15 +1624,16 @@ class SIGMAFLIP:
         self.config_row = ctk.CTkFrame(self.root, fg_color="transparent")
         self.config_row.pack(pady=4, fill="x", padx=45)
 
-        ctk.CTkLabel(self.config_row, text="Resize:", font=self.font_small, text_color=self.sub_color_adaptive, fg_color="transparent").pack(side=tk.LEFT, padx=(0, 5))
+        GridLabel(self.config_row, text="Resize:", font=self.font_small, text_color=self.sub_color_adaptive, fg_color="transparent").pack(side=tk.LEFT, padx=(0, 5))
 
         self.aspect_menu = ctk.CTkOptionMenu(
             self.config_row, values=["Fit (Letterbox)", "Stretch", "Crop (4:3)", "Tiles", "Tiles Stretched"],
             command=self.set_scale_mode,
-            fg_color=self._theme_bg,
-            button_color=self._theme_bg,
+            fg_color=("#e2e8f0", "#2b2b2b"),
+            button_color=("#cbd5e1", "#334155"),
             button_hover_color=self.highlight_color_adaptive,
             dropdown_fg_color=("#ffffff", "#2b2b2b"),
+            dropdown_hover_color=self.highlight_color_adaptive,
             dropdown_text_color=("#1e293b", "#E2E8F0"),
             text_color=self.main_color_adaptive,
             font=self.font_tiny, dropdown_font=self.font_tiny,
@@ -1250,15 +1641,16 @@ class SIGMAFLIP:
         )
         self.aspect_menu.pack(side=tk.LEFT)
 
-        ctk.CTkLabel(self.config_row, text="Mode:", font=self.font_small, text_color=self.sub_color_adaptive, fg_color="transparent").pack(side=tk.LEFT, padx=(15, 5))
+        GridLabel(self.config_row, text="Mode:", font=self.font_small, text_color=self.sub_color_adaptive, fg_color="transparent").pack(side=tk.LEFT, padx=(15, 5))
         self.export_mode_var = ctk.StringVar(value="Video Frames")
         self.export_mode_menu = ctk.CTkOptionMenu(
             self.config_row, values=["Video Frames", "Still Images"],
             variable=self.export_mode_var,
-            fg_color=self._theme_bg,
-            button_color=self._theme_bg,
+            fg_color=("#e2e8f0", "#2b2b2b"),
+            button_color=("#cbd5e1", "#334155"),
             button_hover_color=self.highlight_color_adaptive,
             dropdown_fg_color=("#ffffff", "#2b2b2b"),
+            dropdown_hover_color=self.highlight_color_adaptive,
             dropdown_text_color=("#1e293b", "#E2E8F0"),
             text_color=self.main_color_adaptive,
             font=self.font_tiny, dropdown_font=self.font_tiny,
@@ -1272,28 +1664,27 @@ class SIGMAFLIP:
         self.load_btn = ctk.CTkButton(
             self.ctrl_row, text="", command=self.load_video_dialog,
             width=100, height=36, image=self.icons.get('upload'),
-            fg_color="transparent", text_color=self.main_color_adaptive, hover_color=self.highlight_color_adaptive, corner_radius=8
+            fg_color="transparent", text_color=self.main_color_adaptive, hover_color=self._theme_bg, corner_radius=8
         )
         self.load_btn.pack(side=tk.LEFT, padx=3)
-        self.add_press_feedback(self.load_btn)
+        self._init_icon_btn(self.load_btn, 'upload')
 
         self.play_btn = ctk.CTkButton(
             self.ctrl_row, text="", command=self.toggle_play,
             width=100, height=36, image=self.icons.get('play_disabled'), state="disabled",
-            fg_color="transparent", text_color=self.main_color_adaptive, hover_color=self.highlight_color_adaptive, corner_radius=8
+            fg_color="transparent", text_color=self.main_color_adaptive, hover_color=self._theme_bg, corner_radius=8
         )
         self.play_btn.pack(side=tk.LEFT, padx=3)
-        self.add_press_feedback(self.play_btn)
+        self._init_icon_btn(self.play_btn, 'play', 'disabled')
 
         self.export_btn = ctk.CTkButton(
             self.ctrl_row, text="Export Frames", command=self.export_frames,
-            width=100, height=36, font=self.font_medium_bold, state="disabled",
-            fg_color="transparent",
-            hover_color=self.highlight_color_adaptive,
+            width=100, height=38, font=self.font_medium_bold, state="disabled",
             text_color=self.main_color_adaptive,
             corner_radius=8
         )
         self.export_btn.pack(side=tk.LEFT, padx=3)
+        self.stamp_text_face(self.export_btn)
 
         self.progress_bar = ctk.CTkProgressBar(self.root, progress_color=self.highlight_color_adaptive, height=8)
         self.progress_bar.pack(fill="x", padx=45, pady=8)
@@ -1309,7 +1700,8 @@ class SIGMAFLIP:
             self.tile_rows_entry.insert(0, val)
             self.tile_x_label.pack_forget()
             self.tile_rows_entry.pack_forget()
-            self.tile_link_btn.configure(image=self.icons.get('lock'), fg_color=self.highlight_color_adaptive)
+            self._set_icon(self.tile_link_btn, 'lock')
+            self.tile_link_btn.configure(fg_color=self.highlight_color_adaptive)
             self.play_sound('lock.mp3')
         else:
             val = self.tile_cols_entry.get()
@@ -1317,7 +1709,8 @@ class SIGMAFLIP:
             self.tile_rows_entry.insert(0, val)
             self.tile_x_label.pack(side=tk.LEFT, padx=2, before=self.tile_link_btn)
             self.tile_rows_entry.pack(side=tk.LEFT, padx=5, before=self.tile_link_btn)
-            self.tile_link_btn.configure(image=self.icons.get('unlock'), fg_color="transparent")
+            self._set_icon(self.tile_link_btn, 'unlock')
+            self.tile_link_btn.configure(fg_color="transparent")
             self.play_sound('unlock.mp3')
         self.on_grid_entry_change()
 
@@ -1350,23 +1743,6 @@ class SIGMAFLIP:
             rows = 2
 
         return cols, rows
-
-    def draw_window_grid(self, event=None, forced_mode=None):
-        if event and event.widget != self.root:
-            return
-
-        ww = self.root.winfo_width()
-        wh = self.root.winfo_height()
-        curr_mode = forced_mode if forced_mode else ctk.get_appearance_mode().lower()
-
-        if ww == self.last_grid_w and wh == self.last_grid_h and curr_mode == self.last_grid_mode:
-            return
-
-        self.last_grid_w = ww
-        self.last_grid_h = wh
-        self.last_grid_mode = curr_mode
-
-        draw_grid_on_canvas(self.bg_canvas, ww, wh, curr_mode)
 
     def sync_speed_widget_image(self, force_enabled=None):
         self.speed_widget.delete("speed_img")
@@ -1437,6 +1813,7 @@ class SIGMAFLIP:
 
     def single_click_grid_image(self, index):
         self.play_sound('apply.mp3')
+        self.hide_grid_tooltip()
         old_idx = self.still_index
         self.still_index = index
         self.video_path = self.image_paths[self.still_index]
@@ -1457,12 +1834,17 @@ class SIGMAFLIP:
         y = event.y_root + 10
         self._tooltip_win.wm_geometry(f"+{x}+{y}")
 
+        if ctk.get_appearance_mode().lower() == "light":
+            tip_bg, tip_fg = "#e5e7eb", "#1e293b"
+        else:
+            tip_bg, tip_fg = "#2d2d2d", "#E2E8F0"
+
         lbl = tk.Label(
             self._tooltip_win,
             text=filename,
             font=(self.font_family, 9),
-            bg="#2d2d2d",
-            fg=MAIN_COLOR,
+            bg=tip_bg,
+            fg=tip_fg,
             padx=6,
             pady=4,
             relief="solid",
@@ -1522,16 +1904,8 @@ class SIGMAFLIP:
 
     def _thumb_colors(self, selected):
         if ctk.get_appearance_mode().lower() == "light":
-            return (
-                "#e5e7eb" if selected else "#f3f4f6",
-                self.highlight_color if selected else "#e5e7eb",
-                "#111827" if selected else "#4b5563",
-            )
-        return (
-            "#2d2d2d" if selected else "#1a1a1a",
-            self.highlight_color if selected else "#1a1a1a",
-            self.main_color_adaptive[1] if selected else self.sub_color_adaptive[1],
-        )
+            return ("#f3f4f6", "#f5c518" if selected else "#e5e7eb")
+        return ("#1a1a1a", "#f5c518" if selected else "#1a1a1a")
 
     def _build_thumb_cell(self, idx, cols):
         path = self.image_paths[idx]
@@ -1555,30 +1929,31 @@ class SIGMAFLIP:
             self._thumbnail_tk_images.append(tk_thumb)
 
             is_selected = (idx == self.still_index)
-            bg_clr, border_clr, text_clr = self._thumb_colors(is_selected)
+            bg_clr, border_clr = self._thumb_colors(is_selected)
+            text_clr = "#4b5563" if ctk.get_appearance_mode().lower() == "light" else self.sub_color_adaptive[1]
 
             filename = os.path.basename(path)
             display_name = filename[:9] + "..." if len(filename) > 12 else filename
 
             cell = tk.Frame(self.grid_scroll_frame, bg=bg_clr,
                             highlightbackground=border_clr,
-                            highlightthickness=2 if is_selected else 1,
+                            highlightthickness=3,
                             bd=0, width=92, height=105)
             cell.pack_propagate(False)
 
             img_lbl = tk.Label(cell, image=tk_thumb, bg=bg_clr, bd=0, cursor="hand2")
             img_lbl.pack(pady=(4, 2), padx=4)
-            img_lbl.bind("<Enter>", lambda e, name=filename: self.show_grid_tooltip(e, name))
-            img_lbl.bind("<Leave>", self.hide_grid_tooltip)
-            img_lbl.bind("<Button-1>", lambda e, i=idx: self.single_click_grid_image(i))
 
             txt_lbl = tk.Label(cell, text=f"Frame {idx + 1}\n{display_name}",
                                font=(self.font_family, 9), fg=text_clr, bg=bg_clr,
                                justify="center", cursor="hand2")
             txt_lbl.pack(pady=(0, 4), padx=4, fill="x")
-            txt_lbl.bind("<Enter>", lambda e, name=filename: self.show_grid_tooltip(e, name))
-            txt_lbl.bind("<Leave>", self.hide_grid_tooltip)
-            txt_lbl.bind("<Button-1>", lambda e, i=idx: self.single_click_grid_image(i))
+
+            for widget in (cell, img_lbl, txt_lbl):
+                widget.bind("<Button-1>", lambda e, c=cell: self._on_thumb_click(c))
+            for widget in (img_lbl, txt_lbl):
+                widget.bind("<Enter>", lambda e, c=cell: self._on_thumb_hover(e, c))
+                widget.bind("<Leave>", self.hide_grid_tooltip)
 
             row = idx // cols
             col = idx % cols
@@ -1589,12 +1964,12 @@ class SIGMAFLIP:
             return None
 
     def _update_thumb_selection(self, old_idx, new_idx):
-        _, def_bg, def_border = self._thumb_colors(False)
-        _, sel_bg, sel_border = self._thumb_colors(True)
+        def_bg, def_border = self._thumb_colors(False)
+        sel_bg, sel_border = self._thumb_colors(True)
 
         for idx, bg, border, thick in [
-            (old_idx, def_bg, def_border, 1),
-            (new_idx, sel_bg, sel_border, 2),
+            (old_idx, def_bg, def_border, 3),
+            (new_idx, sel_bg, sel_border, 3),
         ]:
             cell = self._thumb_cells.get(idx)
             if not cell:
@@ -1605,11 +1980,41 @@ class SIGMAFLIP:
                     child.configure(bg=bg)
                 except Exception:
                     pass
+        self._apply_grab_tint()
 
-        if getattr(self, "_rearrange_grab", False):
-            grabbed = self._thumb_cells.get(self.still_index)
-            if grabbed:
-                grabbed.configure(highlightbackground="#f5c518", highlightthickness=3)
+    def _apply_grab_tint(self):
+        """The grabbed frame (Enter during rearrange) gets a tinted tile so the grab is
+        visible: the gold outline alone is the plain cursor, so without this Enter looks
+        like it did nothing."""
+        cell = self._thumb_cells.get(self.still_index)
+        if not cell:
+            return
+        if self._rearrange_mode and self._rearrange_grab:
+            bg = ("#fde68a" if ctk.get_appearance_mode().lower() == "light" else "#6b5510")
+        else:
+            bg = self._thumb_colors(True)[0]
+        try:
+            cell.configure(bg=bg)
+            for child in cell.winfo_children():
+                child.configure(bg=bg)
+        except Exception:
+            pass
+
+    def _thumb_index_of(self, cell):
+        for idx, c in self._thumb_cells.items():
+            if c is cell:
+                return idx
+        return None
+
+    def _on_thumb_click(self, cell):
+        idx = self._thumb_index_of(cell)
+        if idx is not None:
+            self.single_click_grid_image(idx)
+
+    def _on_thumb_hover(self, event, cell):
+        idx = self._thumb_index_of(cell)
+        if idx is not None:
+            self.show_grid_tooltip(event, os.path.basename(self.image_paths[idx]))
 
     def _swap_thumb_cells(self, idx1, idx2):
         if idx1 not in self._thumb_cells or idx2 not in self._thumb_cells:
@@ -1699,17 +2104,15 @@ class SIGMAFLIP:
                 self.advanced_settings["dither_mode"] = "None"
 
             self.audio_enabled = config.get("audio_enabled", True)
+            self.continuous_export = config.get("continuous_export", False)
             self.bg_type = config.get("bg_type", "black")
             self.bg_image_path = config.get("bg_image_path", None)
             self.export_structure = config.get("export_structure", "dcim")
             self.console_type = config.get("console_type", "dsi")
             self.bg_type_var.set(self.bg_type)
             self.export_structure_var.set(self.export_structure)
-
-            self.options_menu.entryconfigure(
-                0,
-                label="✓ Enable Audio Preview" if self.audio_enabled else "   Enable Audio Preview"
-            )
+            self.audio_menu_var.set(self.audio_enabled)
+            self.continuous_export_var.set(self.continuous_export)
             self.set_bg_menu_type(self.bg_type, silent=True)
             self.set_struct_menu_type(self.export_structure, silent=True)
             self.set_console_type(self.console_type)
@@ -1750,6 +2153,7 @@ class SIGMAFLIP:
         try:
             config_data = {
                 "export_mode": self.export_mode_var.get(),
+                "continuous_export": self.continuous_export,
                 "audio_enabled": self.audio_enabled,
                 "bg_type": self.bg_type,
                 "bg_image_path": self.bg_image_path if self.bg_image_path else "",
@@ -1760,18 +2164,10 @@ class SIGMAFLIP:
             }
             with open(self.config_filepath, "w") as f:
                 json.dump(config_data, f, indent=4)
+            if not IS_WINDOWS:
+                os.chmod(self.config_filepath, 0o600)
         except Exception as e:
             print(f"Error saving user configurations: {e}")
-
-    def purge_pycache_directories(self):
-        try:
-            for root_dir, dirs, files in os.walk(self.base_path):
-                for d in dirs:
-                    if d == "__pycache__":
-                        pycache_path = os.path.join(root_dir, d)
-                        shutil.rmtree(pycache_path, ignore_errors=True)
-        except Exception as e:
-            print(f"Error purging __pycache__ on close: {e}")
 
     def _forget_all_widgets(self):
         for w in (
@@ -1839,9 +2235,10 @@ class SIGMAFLIP:
         self.video_path = None
         self.image_paths = []
         self.file_name_label.configure(text="No File Loaded")
-        self.play_btn.configure(state="disabled", image=self.icons.get('play_disabled'))
+        self._set_icon(self.play_btn, 'play', "disabled")
         self.export_btn.configure(state="disabled")
         self.current_frame_idx = 0.0
+        self.timeline_slider.set(0)
         self.video_canvas.delete("all")
 
         self._cleanup_audio()
@@ -1852,15 +2249,15 @@ class SIGMAFLIP:
             self.repack_singular_image_layout()
             self.file_name_label.configure(text="No Image Loaded")
             self.export_btn.configure(text="Export Frame")
-            self.limit_indicator.configure(text="Export Frames: 0 / 999", text_color=SUB_COLOR)
+            self.limit_indicator.configure(text="Export Frames: 0 / 999", text_color=self.sub_color_adaptive)
             self.update_nav_buttons_state()
         else:
             self.repack_video_layout()
-            self.play_btn.configure(state="disabled", image=self.icons.get('play_disabled'))
+            self._set_icon(self.play_btn, 'play', "disabled")
             self.file_name_label.configure(text="No Video Loaded")
             self.limit_indicator.configure(
                 text="Export Frames: 0 / 999",
-                text_color=SUB_COLOR
+                text_color=self.sub_color_adaptive
             )
             self.export_btn.configure(text="Export Frames")
 
@@ -1961,7 +2358,20 @@ class SIGMAFLIP:
         self.file_name_label.configure(text=os.path.basename(file_path))
         self.export_btn.configure(state="normal")
 
-        self.cap = cv2.VideoCapture(file_path)
+        self.cap = FFmpegVideoCapture(file_path)
+        if not self.cap.isOpened():
+            self.play_sound('warning.mp3')
+            messagebox.showerror(
+                "Unsupported Video",
+                "This video could not be decoded.\n\n"
+                "SIGMAFLIP reads frames through FFmpeg/ffprobe; make sure both are installed "
+                "and available on your PATH."
+            )
+            self.cap = None
+            self.video_path = None
+            self.file_name_label.configure(text="No File Loaded")
+            self.export_btn.configure(state="disabled")
+            return
         self.total_video_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.video_fps = self.cap.get(cv2.CAP_PROP_FPS)
         if self.video_fps <= 0:
@@ -2001,7 +2411,7 @@ class SIGMAFLIP:
                     pass
         self.video_duration = self.total_video_frames / self.video_fps
 
-        self.play_btn.configure(state="normal", image=self.icons.get('play'))
+        self._set_icon(self.play_btn, 'play', "normal")
         self.current_frame_idx = 0.0
         self.timeline_slider.configure(from_=0, to=max(1, self.total_video_frames - 1))
         self.timeline_slider.set(0)
@@ -2047,9 +2457,6 @@ class SIGMAFLIP:
         if self.still_index != last:
             self._navigate(last, 'end.mp3')
 
-    def _set_nav_btn_state(self, btn, state, icon_name):
-        btn.configure(state=state, image=self.icons.get(icon_name))
-
     def update_nav_buttons_state(self):
         total = len(self.image_paths)
 
@@ -2058,36 +2465,40 @@ class SIGMAFLIP:
                 self.delete_frame_btn.configure(state="disabled")
             else:
                 self.delete_frame_btn.configure(state="normal")
+        if hasattr(self, "move_left_btn"):
+            last = total - 1
+            self.move_left_btn.configure(state="disabled" if self.still_index <= 0 else "normal")
+            self.move_right_btn.configure(state="disabled" if self.still_index >= last else "normal")
 
         if total <= 1:
-            self._set_nav_btn_state(self.beg_btn, "disabled", 'beg_disabled')
-            self._set_nav_btn_state(self.prev_btn, "disabled", 'prev_disabled')
-            self._set_nav_btn_state(self.next_btn, "disabled", 'next_disabled')
-            self._set_nav_btn_state(self.end_btn, "disabled", 'end_disabled')
+            self._set_icon(self.beg_btn, 'beg', "disabled")
+            self._set_icon(self.prev_btn, 'prev', "disabled")
+            self._set_icon(self.next_btn, 'next', "disabled")
+            self._set_icon(self.end_btn, 'end', "disabled")
             self.nav_label.configure(text=f"1 of {total}" if total == 1 else "0 of 0")
             return
 
         self.nav_label.configure(text=f"{self.still_index + 1} of {total}")
 
         if self.still_index == 0:
-            self._set_nav_btn_state(self.beg_btn, "disabled", 'beg_disabled')
+            self._set_icon(self.beg_btn, 'beg', "disabled")
         else:
-            self._set_nav_btn_state(self.beg_btn, "normal", 'beg')
+            self._set_icon(self.beg_btn, 'beg', "normal")
 
         if self.still_index == 0:
-            self._set_nav_btn_state(self.prev_btn, "disabled", 'prev_disabled')
+            self._set_icon(self.prev_btn, 'prev', "disabled")
         else:
-            self._set_nav_btn_state(self.prev_btn, "normal", 'prev')
+            self._set_icon(self.prev_btn, 'prev', "normal")
 
         if self.still_index == total - 1:
-            self._set_nav_btn_state(self.next_btn, "disabled", 'next_disabled')
+            self._set_icon(self.next_btn, 'next', "disabled")
         else:
-            self._set_nav_btn_state(self.next_btn, "normal", 'next')
+            self._set_icon(self.next_btn, 'next', "normal")
 
         if self.still_index == total - 1:
-            self._set_nav_btn_state(self.end_btn, "disabled", 'end_disabled')
+            self._set_icon(self.end_btn, 'end', "disabled")
         else:
-            self._set_nav_btn_state(self.end_btn, "normal", 'end')
+            self._set_icon(self.end_btn, 'end', "normal")
 
     def extract_audio_thread(self):
         """Asynchronously extracts audio from video in an easily seekable format (OGG Vorbis -> MP3 -> WAV)."""
@@ -2098,7 +2509,6 @@ class SIGMAFLIP:
         self._temp_audio_dir = tempfile.mkdtemp(prefix="sigmaflip_preview_")
         base_tmp = os.path.join(self._temp_audio_dir, "audio")
 
-        # Priority: OGG (native seek in SDL_mixer/pygame) -> MP3 -> PCM WAV fallback
         candidates = [
             (f"{base_tmp}.ogg", ["-c:a", "libvorbis", "-q:a", "4"]),
             (f"{base_tmp}.ogg", ["-c:a", "vorbis", "-q:a", "4"]),
@@ -2181,28 +2591,13 @@ class SIGMAFLIP:
 
     def update_indicator_metrics(self, estimated_frames):
         if self.export_mode_var.get() == "Still Images":
-            total_images = len(self.image_paths)
-            if total_images > 1:
-                self.limit_indicator.configure(
-                    text=f"Export Frames: {total_images} (Batch Mode)",
-                    text_color=self.main_color_adaptive
-                )
-            else:
-                self.limit_indicator.configure(
-                    text="Export Frames: 1",
-                    text_color=self.main_color_adaptive
-                )
+            count = len(self.image_paths)
         else:
-            if estimated_frames > MAX_FRAMES:
-                self.limit_indicator.configure(
-                    text=f"Export Frames: {estimated_frames} / {MAX_FRAMES}",
-                    text_color="#FF4D4D"
-                )
-            else:
-                self.limit_indicator.configure(
-                    text=f"Export Frames: {estimated_frames} / {MAX_FRAMES}",
-                    text_color=self.main_color_adaptive
-                )
+            count = estimated_frames
+        self.limit_indicator.configure(
+            text=f"Export Frames: {count} / {MAX_FRAMES}",
+            text_color=("#b91c1c", "#FF4D4D") if count > MAX_FRAMES else self.main_color_adaptive
+        )
 
     def set_scale_mode(self, value):
         self.play_sound('apply.mp3')
@@ -2260,6 +2655,10 @@ class SIGMAFLIP:
 
             if target_frame != current_pos:
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                current_pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+
+            if target_frame < current_pos:
+                return
 
             ret, frame = self.cap.read()
             if not ret:
@@ -2319,7 +2718,6 @@ class SIGMAFLIP:
             if not self.after_play_id:
                 self.playback_tick()
         else:
-            # Paused: keep audio completely silent
             try:
                 pygame.mixer.music.stop()
             except Exception:
@@ -2362,7 +2760,7 @@ class SIGMAFLIP:
 
         if self.playing:
             self.playing = False
-            self.play_btn.configure(image=self.icons.get('play'))
+            self._set_icon(self.play_btn, 'play')
             self.play_sound('stoppause.mp3')
 
             try:
@@ -2378,7 +2776,7 @@ class SIGMAFLIP:
                 self.update_frame_display()
         else:
             self.playing = True
-            self.play_btn.configure(image=self.icons.get('pause'))
+            self._set_icon(self.play_btn, 'pause')
             self.play_sound('playresume.mp3')
             self.sync_speed_widget_image()
 
@@ -2393,7 +2791,6 @@ class SIGMAFLIP:
             return
 
         if self._is_scrubbing:
-            # User is actively dragging slider; keep timer alive but do not fight user input
             target_fps = SPEED_FPS[self.speed]
             interval_ms = max(10, int(1000.0 / target_fps))
             self.after_play_id = self.root.after(interval_ms, self.playback_tick)
@@ -2403,7 +2800,6 @@ class SIGMAFLIP:
         frame_step = max(1, round(self.video_fps / target_fps))
         elapsed = time.perf_counter() - self._playback_start_time
 
-        # High precision perf_counter ensures 1:1 sync with audio without SDL timer drift
         self.current_frame_idx = self._playback_start_frame + (elapsed * self.video_fps)
 
         if frame_step > 1:
@@ -2437,6 +2833,8 @@ class SIGMAFLIP:
         self.on_slider_scrub(int((self.total_video_frames - 1) * (digit / 9.0)))
 
     def stop_playback(self):
+        if self.export_mode_var.get() == "Still Images":
+            return
         if self.playing:
             self.toggle_play()
         if self.cap or self.gif_img:
@@ -2456,6 +2854,11 @@ class SIGMAFLIP:
     def on_global_key(self, event):
         if getattr(self, "_exporting", False):
             return None
+        try:
+            if str(event.widget.winfo_toplevel()) != str(self.root):
+                return None
+        except Exception:
+            pass
         if event.widget.winfo_class() in ("Entry", "Spinbox", "Text"):
             return None
         ks = event.keysym
@@ -2480,7 +2883,9 @@ class SIGMAFLIP:
                 return "break"
             return None
 
-        if ks == "Up" or ks == "Down":
+        if ks in ("Up", "Down"):
+            if is_singular or self.playing:
+                return "break"
             delta = 1 if ks == "Up" else -1
             self.set_flipnote_speed(max(1, min(8, self.speed + delta)))
             return "break"
@@ -2502,19 +2907,25 @@ class SIGMAFLIP:
         if ks == "Escape":
             if self._rearrange_mode:
                 self.exit_rearrange_mode()
-                return "break"
-            self.stop_playback()
+            elif not is_singular:
+                self.stop_playback()
             return "break"
 
         if is_singular:
-            if ks in ("grave", "asciitilde"):
-                self.play_sound('apply.mp3')
+            if ks in ("grave", "asciitilde", "`", "~"):
                 if self._rearrange_mode:
+                    self.play_sound('apply.mp3')
                     self.exit_rearrange_mode()
                     if self.current_singular_view == "grid":
                         self.switch_to_preview_view()
-                else:
+                elif self.image_paths:
+                    self.play_sound('apply.mp3')
                     self.start_rearrange_mode()
+                return "break"
+            if ks == "BackSpace":
+                if self._throttle("delete_frame"):
+                    return "break"
+                self.delete_selected_frame()
                 return "break"
             if self._rearrange_mode:
                 if ks == "Return":
@@ -2576,11 +2987,12 @@ class SIGMAFLIP:
     def show_keybinds(self):
         if getattr(self, "_keybind_win", None) is not None and self._keybind_win.winfo_exists():
             self._keybind_win.lift()
+            self._keybind_win.focus_force()
             return
+
         win = ctk.CTkToplevel(self.root)
         self._keybind_win = win
         win.title("Keyboard Shortcuts")
-        win.geometry("560x600")
         win.resizable(False, False)
         win.transient(self.root)
         win.configure(fg_color=("#f3f4f6", "#151515"))
@@ -2595,56 +3007,68 @@ class SIGMAFLIP:
         sub = self.sub_color_adaptive
         accent = self.highlight_color_adaptive
 
+        pad_x, pad_y = 28, 16
         frame = ctk.CTkFrame(win, fg_color="transparent")
-        frame.pack(fill="both", expand=True, padx=24, pady=16)
+        frame.pack(fill="both", expand=True, padx=pad_x, pady=pad_y)
 
-        ctk.CTkLabel(
+        GridLabel(
             frame, text="Keyboard Shortcuts", font=self.font_title,
             text_color=main, fg_color="transparent"
-        ).pack(pady=(0, 6))
+        ).pack(pady=(0, 10))
 
-        content = ctk.CTkScrollableFrame(frame, fg_color="transparent")
-        content.pack(fill="both", expand=True)
+        key_font = symbol_font(self.font_family, 16, scaling=frame._get_widget_scaling())
+        mod_name = "\u2318" if IS_MAC else "Ctrl"
 
         sections = [
             ("VIDEO PLAYBACK", [
-                ("↑/↓", "Change Flipnote speed"),
-                ("Space/K", "Play/pause"),
-                ("←/→", "Skip backward/forward 5 seconds"),
-                ("J/L", "Skip backward/forward 10 seconds"),
-                ("0-9", "Jump to that point of the video"),
+                ("\u2191 / \u2193", "Change Flipnote speed"),
+                ("Space / K", "Play / pause"),
+                ("\u2190 / \u2192", "Skip backward / forward 5 seconds"),
+                ("J / L", "Skip backward / forward 10 seconds"),
+                ("0 - 9", "Jump to video position (0% - 90%)"),
                 ("Escape", "Stop playback"),
-                ("Ctrl+O/⌘+O", "Load photos/video"),
-                ("Ctrl+S/⌘+S", "Export frames"),
             ]),
             ("STILL IMAGES MODE", [
-                ("←/→", "Previous/next image"),
-                ("Shift+←/Shift+→", "Jump to first/last image"),
-                ("`", "Rearrange images in grid view (Enter to select, Left/Right to move)"),
+                ("\u2190 / \u2192", "Previous / next image"),
+                ("Shift+\u2190 / Shift+\u2192", "Jump to first / last image"),
+                ("Backspace", "Delete the selected image"),
+                ("`", "Rearrange images in grid view (Enter to select, \u2190/\u2192 to move)"),
             ]),
             ("OTHER", [
-                ("Ctrl+Shift+O/⌘+Shift+O", "Switch between Video Frames and Still Images mode"),
+                (f"{mod_name}+O", "Load photos or video"),
+                (f"{mod_name}+S", "Export frames"),
+                (f"{mod_name}+Shift+O", "Switch between Video and Still Images mode"),
                 ("\\", "Toggle tile linking"),
             ]),
         ]
-        for title, items in sections:
-            ctk.CTkLabel(
-                content, text=title, font=self.font_small,
+
+        table = ctk.CTkFrame(frame, fg_color="transparent")
+        table.pack(fill="both", expand=True)
+        table.grid_columnconfigure(1, weight=1)
+
+        row = 0
+        for sec_title, items in sections:
+            GridLabel(
+                table, text=sec_title, font=self.font_small, anchor="n",
                 text_color=accent, fg_color="transparent"
-            ).pack(pady=(12, 4))
-            for key, desc in items:
-                row = ctk.CTkFrame(content, fg_color="transparent")
-                row.pack(fill="x", pady=2)
-                row.columnconfigure(1, weight=1)
-                ctk.CTkLabel(
-                    row, text=key, font=self.font_medium_bold,
-                    width=200, anchor="w", text_color=main, fg_color="transparent"
-                ).grid(row=0, column=0, sticky="w")
-                ctk.CTkLabel(
-                    row, text=desc, font=self.font_tiny,
-                    anchor="w", justify="left", wraplength=270,
+            ).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 2))
+            row += 1
+
+            for key_str, desc_str in items:
+                GridLabel(
+                    table, text=key_str, font=key_font,
+                    text_color=main, fg_color="transparent", width=190
+                ).grid(row=row, column=0, sticky="w", padx=(6, 16), pady=1)
+
+                GridLabel(
+                    table, text=desc_str, font=self.font_tiny,
                     text_color=sub, fg_color="transparent"
-                ).grid(row=0, column=1, sticky="w", padx=(8, 0))
+                ).grid(row=row, column=1, sticky="w", pady=1)
+                row += 1
+
+        frame.update_idletasks()
+        win.geometry(f"{frame.winfo_reqwidth() + 2 * pad_x}x"
+                     f"{frame.winfo_reqheight() + 2 * pad_y}")
 
         def close():
             win.destroy()
@@ -2678,9 +3102,11 @@ class SIGMAFLIP:
 
     def get_export_worker_count(self) -> int:
         total_cores = os.cpu_count() or 1
+        if total_cores <= 2:
+            return 1
         if self.advanced_settings.get("performance_mode", False):
             return max(1, min(total_cores - 1, 2))
-        return max(1, min(total_cores, 8))
+        return max(1, min(total_cores - 1, 6))
 
     def set_export_priority(self, low_end_mode: bool):
         if IS_WINDOWS:
@@ -2692,41 +3118,52 @@ class SIGMAFLIP:
             except Exception:
                 pass
 
-    def _sign_and_partition(self, output_dir: str, sources: list[str], base_time: float, remove_sources: bool = False, progress_range: tuple = (0.0, 1.0)) -> tuple[int, int]:
+    def _sign_and_partition(self, output_dir: str, sources: list[str], base_time: float, remove_sources: bool = False, progress_range: tuple = (0.0, 1.0), append_info: dict = None) -> tuple[int, int]:
         batch_size = max(1, int(self.advanced_settings.get("album_capacity", 100)))
         dsi_suffix = "NIN02" if self.console_type == "dsi" else "NIN01"
         use_parts = (self.export_structure == "parts")
 
-        total = len(sources)
+        batch_index = 1
+        folder_idx = 1 if use_parts else 100
+        file_idx = 0
+        used_in_batch = 0
+        if append_info:
+            batch_index = append_info["batch_index"]
+            folder_idx = append_info["folder_idx"]
+            file_idx = append_info["file_idx"]
+            used_in_batch = append_info["used_in_batch"]
+            base_time = append_info["next_base_time"]
+
         p_start, p_end = progress_range
         p_span = p_end - p_start
 
-        if use_parts:
-            batches = [("", sources)]
-        else:
-            batches = []
-            for i in range(0, total, batch_size):
-                label = "DCIM" if i == 0 else f"DCIM_{i // batch_size + 1}"
-                batches.append((label, sources[i:i + batch_size]))
-
         jobs = []
-        folder_sets = 0
-        for batch_label, batch in batches:
-            for part_idx, chunk in enumerate([batch[i:i + 100] for i in range(0, len(batch), 100)]):
-                if use_parts:
-                    part_dir = os.path.join(output_dir, f"SFPart_{part_idx + 1}")
-                else:
-                    part_dir = os.path.join(output_dir, batch_label, f"{100 + part_idx}{dsi_suffix}")
-                os.makedirs(part_dir, exist_ok=True)
-                folder_sets += 1
-                for file_idx, src in enumerate(chunk):
-                    frame_time = base_time + len(jobs) * 2
-                    time_str = time.strftime("%Y:%m:%d %H:%M:%S", time.localtime(frame_time))
-                    new_filepath = os.path.join(part_dir, f"HNI_{file_idx + 1:04d}.JPG")
-                    jobs.append([src, new_filepath, time_str, frame_time])
+        folder_sets = set()
+        for src in sources:
+            if file_idx >= 100:
+                folder_idx += 1
+                file_idx = 0
+            if not use_parts and used_in_batch >= batch_size:
+                batch_index += 1
+                folder_idx = 100
+                file_idx = 0
+                used_in_batch = 0
+            if use_parts:
+                part_dir = os.path.join(output_dir, f"SFPart_{folder_idx}")
+            else:
+                batch_label = "DCIM" if batch_index == 1 else f"DCIM_{batch_index}"
+                part_dir = os.path.join(output_dir, batch_label, f"{folder_idx}{dsi_suffix}")
+            os.makedirs(part_dir, exist_ok=True)
+            folder_sets.add(part_dir)
+
+            file_idx += 1
+            used_in_batch += 1
+            frame_time = base_time + len(jobs) * 2
+            time_str = time.strftime("%Y:%m:%d %H:%M:%S", time.localtime(frame_time))
+            jobs.append([src, os.path.join(part_dir, f"HNI_{file_idx:04d}.JPG"), time_str, frame_time])
 
         if not jobs:
-            return 0, folder_sets
+            return 0, len(folder_sets)
         total_jobs = len(jobs)
 
         params = {
@@ -2740,8 +3177,13 @@ class SIGMAFLIP:
         }
         work = [(j[0], j[1], j[2], params) for j in jobs]
 
+        last_reported_pct = [-1.0]
+
         def _report(done):
-            self._ui_call(lambda p=p_start + p_span * (done / max(1, total_jobs)): self.progress_bar.set(p))
+            pct = p_start + p_span * (done / max(1, total_jobs))
+            if pct - last_reported_pct[0] >= 0.01 or done == total_jobs:
+                last_reported_pct[0] = pct
+                self._ui_call(lambda p=pct: self.progress_bar.set(p))
 
         pool = None
         is_low_end_mode = bool(self.advanced_settings.get("performance_mode", False))
@@ -2796,7 +3238,7 @@ class SIGMAFLIP:
             except Exception:
                 pass
 
-        return signed_count, folder_sets
+        return signed_count, len(folder_sets)
 
     def _commit_staged_export(self, staging_dir, final_dir):
         try:
@@ -2816,7 +3258,105 @@ class SIGMAFLIP:
             ))
             return ""
 
+    def _stage_and_commit(self, output_dir, final_dir, sources, progress_range):
+        """Signs+partitions sources into the console layout, commits the staging dir, and
+        reports the save. Shared tail of every export pipeline; returns what the caller
+        needs to word its completion message."""
+        base_time = time.time()
+        append_info = self._find_append_starting_point(final_dir) if self.continuous_export else None
+        signed_count, _folder_sets = self._sign_and_partition(
+            output_dir, sources, base_time, remove_sources=False,
+            progress_range=progress_range, append_info=append_info)
+        self._ui_call(lambda: self.play_sound('save.mp3'))
+        self._commit_staged_export(output_dir, final_dir)
+        cache_note = self._cleanup_dsi_album_cache(final_dir) if self.console_type == "dsi" else ""
+        return signed_count, append_info, cache_note
+
+    def _find_append_starting_point(self, target_dir: str):
+        """Where the numbering stopped in an existing export, so a new one continues it.
+
+        Returns None when there is nothing to continue. Timestamps matter as much as the
+        numbers: the DSi album is ordered by the date inside each photo, so the new frames
+        have to carry the second after the newest existing one or they land at the wrong
+        end of the timeline. Seeding that search with time.time() would date every appended
+        frame "now" and open a gap the size of the gap between the two exports.
+        """
+        dsi_suffix = "NIN02" if self.console_type == "dsi" else "NIN01"
+        use_parts = (self.export_structure == "parts")
+        if not os.path.isdir(target_dir):
+            return None
+
+        def _scan_folder(path):
+            """(highest HNI number, newest photo mtime, photo count) for one part folder."""
+            top, newest, count = 0, 0.0, 0
+            try:
+                names = os.listdir(path)
+            except OSError:
+                return top, newest, count
+            for name in names:
+                upper = name.upper()
+                if not (upper.startswith("HNI_") and upper.endswith(".JPG")):
+                    continue
+                try:
+                    num = int(name[4:8])
+                except ValueError:
+                    continue
+                count += 1
+                top = max(top, num)
+                try:
+                    newest = max(newest, os.path.getmtime(os.path.join(path, name)))
+                except OSError:
+                    pass
+            return top, newest, count
+
+        try:
+            entries = os.listdir(target_dir)
+        except OSError:
+            return None
+
+        slots = []
+        if use_parts:
+            for name in entries:
+                m = re.match(r"^SFPart_(\d+)$", name)
+                if m:
+                    slots.append((1, int(m.group(1)), os.path.join(target_dir, name)))
+        else:
+            batches = []
+            for name in entries:
+                if name == "DCIM":
+                    batches.append((1, name))
+                else:
+                    m = re.match(r"^DCIM_(\d+)$", name)
+                    if m:
+                        batches.append((int(m.group(1)), name))
+            for batch_index, batch_name in sorted(batches):
+                batch_dir = os.path.join(target_dir, batch_name)
+                try:
+                    subs = os.listdir(batch_dir)
+                except OSError:
+                    continue
+                for sub in subs:
+                    if len(sub) == 8 and sub[:3].isdigit() and sub.endswith(dsi_suffix):
+                        slots.append((batch_index, int(sub[:3]), os.path.join(batch_dir, sub)))
+        slots.sort(key=lambda slot: slot[:2])
+
+        per_batch, resume, newest_any = {}, None, 0.0
+        for batch_index, folder_idx, path in slots:
+            top, newest, count = _scan_folder(path)
+            newest_any = max(newest_any, newest)
+            used = per_batch.get(batch_index, 0) + count
+            per_batch[batch_index] = used
+            if count:
+                resume = {"batch_index": batch_index, "folder_idx": folder_idx,
+                          "file_idx": top, "used_in_batch": used}
+        if resume is None:
+            return None
+        resume["next_base_time"] = newest_any + 2.0
+        return resume
+
     def _handle_existing_images_backup(self, target_dir):
+        if self.continuous_export:
+            return True, ""
         try:
             entries = [e for e in os.listdir(target_dir)
                        if e == "DCIM" or e.startswith("DCIM_") or e.startswith("SFPart_")]
@@ -2828,7 +3368,8 @@ class SIGMAFLIP:
             "Existing Export Folders Found",
             f"The destination folder contains {len(entries)} previous export folder(s) "
             f"({', '.join(entries)}).\n\n"
-            "Move them into a backup subfolder before exporting?",
+            "Move them into a backup subfolder before exporting?\n\n"
+            "(Enable Options > Continuous Export to append frames to them instead.)",
             parent=self.root
         ):
             self.play_sound('back.mp3')
@@ -2849,25 +3390,24 @@ class SIGMAFLIP:
         self.play_sound('apply.mp3')
         return True, f"\n\n{len(entries)} previous export folder(s) were moved into:\n{backup_dir}"
 
-    def run_batch_image_export_pipeline(self, output_dir: str, final_dir: str) -> None:
+    def run_still_image_export_pipeline(self, output_dir: str, final_dir: str) -> None:
         try:
             self._exporting = True
-            base_time = time.time()
-            signed_count, folder_sets = self._sign_and_partition(
-                output_dir, self.image_paths, base_time, remove_sources=False)
+            signed_count, append_info, cache_note = self._stage_and_commit(
+                output_dir, final_dir, self.image_paths, (0.0, 1.0))
 
-            self._ui_call(lambda: self.play_sound('save.mp3'))
-            self._commit_staged_export(output_dir, final_dir)
-            cache_note = self._cleanup_dsi_album_cache(final_dir) if self.console_type == "dsi" else ""
-            shown_dir = final_dir
-            self._ui_call(lambda c=signed_count, note=cache_note, d=shown_dir, bk=getattr(self, "_export_backup_note", ""): self._notify_export_complete(
+            img_word = "picture" if len(self.image_paths) == 1 else "pictures"
+            action_desc = "appended" if append_info else "exported and structured"
+            bk = getattr(self, "_export_backup_note", "")
+
+            self._ui_call(lambda c=signed_count, note=cache_note, d=final_dir, bk=bk, w=img_word, act=action_desc: self._notify_export_complete(
                 "Export Complete",
-                f"Successfully formatted, signed, and grouped {c} still images into selected directory layout!"
-                + "\n\nFiles were moved into your selected folder." + bk + note, d
+                f"Successfully {act} {c} {w} into the DCIM directory layout!"
+                + "\n\nFiles were saved into your selected destination." + bk + note, d
             ))
         except Exception as e:
             self._ui_call(lambda: self.play_sound('warning.mp3'))
-            self._ui_call(lambda err=e: messagebox.showerror("Export Failure", f"An error occurred during batch still export:\n{str(err)}"))
+            self._ui_call(lambda err=e: messagebox.showerror("Export Failure", f"An error occurred during picture export:\n{str(err)}"))
         finally:
             self._exporting = False
             self._ui_call(lambda: self.toggle_widgets_interactive_state(enabled=True))
@@ -2884,66 +3424,29 @@ class SIGMAFLIP:
             if not self.image_paths:
                 return
 
-            if len(self.image_paths) > 1:
-                final_dir = filedialog.askdirectory(title="Select Folder to Save Signed JPEGs")
-                if not final_dir:
-                    self.play_sound('back.mp3')
-                    return
-                ok, bknote = self._handle_existing_images_backup(final_dir)
-                if not ok:
-                    return
-                self._export_backup_note = bknote
-                staging_dir = tempfile.mkdtemp(prefix="sigmaflip_export_")
-                self.progress_bar.set(0)
-                self.toggle_widgets_interactive_state(enabled=False)
-                threading.Thread(
-                    target=self.run_batch_image_export_pipeline,
-                    args=(staging_dir, final_dir),
-                    daemon=True
-                ).start()
-                return
-
-            target_file = filedialog.asksaveasfilename(
-                title="Save Signed DSi JPEG",
-                initialfile="HNI_0001.JPG",
-                defaultextension=".JPG",
-                filetypes=[("DSi Signed JPEG", "*.JPG")]
-            )
-            if not target_file:
+            final_dir = filedialog.askdirectory(
+                title="Select Destination Folder (e.g. SD Card Root)")
+            if not final_dir:
                 self.play_sound('back.mp3')
                 return
 
-            ok, bknote = self._handle_existing_images_backup(os.path.dirname(target_file))
+            ok, bknote = self._handle_existing_images_backup(final_dir)
             if not ok:
                 return
             self._export_backup_note = bknote
 
-            try:
-                self._exporting = True
-                pil_img = Image.open(self.video_path).convert("RGBA")
-                pil_img = self.apply_scaling_to_image(pil_img, 640, 480)
-                pil_img.info.clear()
+            staging_dir = tempfile.mkdtemp(prefix="sigmaflip_export_")
+            self.progress_bar.set(0)
+            self.toggle_widgets_interactive_state(enabled=False)
 
-                time_str = time.strftime("%Y:%m:%d %H:%M:%S", time.localtime())
-                encode_sign_frame_mod(pil_img, time_str, target_file)
-
-                os.utime(target_file, (time.time(), time.time()))
-                self.play_sound('apply.mp3')
-                console_name = "Nintendo DSi" if self.console_type == "dsi" else "Nintendo 3DS"
-                self._notify_export_complete(
-                    "Export Complete",
-                    f"Successfully exported, timestamped, and signed still image for {console_name}!"
-                    + getattr(self, "_export_backup_note", ""),
-                    os.path.dirname(target_file)
-                )
-            except Exception as e:
-                self.play_sound('warning.mp3')
-                messagebox.showerror("Export Failure", f"Failed to export still image:\n{str(e)}")
-            finally:
-                self._exporting = False
+            threading.Thread(
+                target=self.run_still_image_export_pipeline,
+                args=(staging_dir, final_dir),
+                daemon=True
+            ).start()
             return
 
-        final_dir = filedialog.askdirectory(title="Choose Output Export Directory")
+        final_dir = filedialog.askdirectory(title="Choose Output Export Directory (e.g. SD Card Root)")
         if not final_dir:
             self.play_sound('back.mp3')
             return
@@ -2989,6 +3492,7 @@ class SIGMAFLIP:
             self._exporting = True
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, creationflags=_NO_WINDOW)
             stderr_tail = []
+            last_frame_pct = -1.0
             while True:
                 line = process.stderr.readline()
                 if not line:
@@ -3000,7 +3504,9 @@ class SIGMAFLIP:
                         parts = line.split("frame=")[1].strip().split()
                         curr_exported_frame = int(parts[0])
                         progress_val = min(0.05, (curr_exported_frame / max(1, exact_frames)) * 0.05)
-                        self._ui_call(lambda p=progress_val: self.progress_bar.set(p))
+                        if progress_val - last_frame_pct >= 0.001:
+                            last_frame_pct = progress_val
+                            self._ui_call(lambda p=progress_val: self.progress_bar.set(p))
                     except Exception:
                         pass
             process.wait()
@@ -3024,19 +3530,17 @@ class SIGMAFLIP:
             if process.returncode == 0 and temp_filenames:
                 self._ui_call(lambda: self.file_name_label.configure(text="Timestamping, Signing & Splitting...", text_color=MAIN_COLOR))
 
-                base_time = time.time()
                 sources = [os.path.join(temp_dir, f) for f in temp_filenames]
-                signed_count, folder_sets = self._sign_and_partition(
-                    output_dir, sources, base_time, remove_sources=False, progress_range=(0.05, 1.0))
+                signed_count, append_info, cache_note = self._stage_and_commit(
+                    output_dir, final_dir, sources, (0.05, 1.0))
 
-                self._ui_call(lambda: self.play_sound('save.mp3'))
-                self._ui_call(lambda: self.file_name_label.configure(text=os.path.basename(self.video_path), text_color=SUB_COLOR))
-                self._commit_staged_export(output_dir, final_dir)
-                cache_note = self._cleanup_dsi_album_cache(final_dir) if self.console_type == "dsi" else ""
-                shown_dir = final_dir
-                self._ui_call(lambda c=signed_count, p=folder_sets, note=cache_note, d=shown_dir, bk=getattr(self, "_export_backup_note", ""): self._notify_export_complete(
-                    "Export Complete", f"Successfully exported, timestamped, and signed {c} frames grouped into {p} folder sets!"
-                    + "\n\nFiles were moved into your selected folder." + bk + note, d
+                self._ui_call(lambda: self.file_name_label.configure(text=os.path.basename(self.video_path), text_color=self.sub_color_adaptive))
+                mode_desc = "appended to the existing export" if append_info else "exported"
+                bk = getattr(self, "_export_backup_note", "")
+                self._ui_call(lambda c=signed_count, note=cache_note, d=final_dir, bk=bk, m=mode_desc: self._notify_export_complete(
+                    "Export Complete",
+                    f"Successfully {m} ({c} frames) into the selected directory layout!"
+                    + "\n\nFiles were saved into your selected folder." + bk + note, d
                 ))
             else:
                 detail = "No frames were written." if process.returncode == 0 else f"FFmpeg returned code {process.returncode}."
@@ -3055,11 +3559,11 @@ class SIGMAFLIP:
     def toggle_widgets_interactive_state(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
         self.options_menu.entryconfigure(self.adv_menu_index, state=state)
-        self.load_btn.configure(state=state, image=self.icons.get('upload' if enabled else 'upload_disabled'))
+        self._set_icon(self.load_btn, 'upload', state)
         if self.export_mode_var.get() == "Still Images":
             self.play_btn.configure(state="disabled")
         else:
-            self.play_btn.configure(state=state, image=self.icons.get('play' if enabled else 'play_disabled'))
+            self._set_icon(self.play_btn, 'play', state)
         self.export_btn.configure(state=state)
         self.aspect_menu.configure(state=state)
         self.export_mode_menu.configure(state=state)
@@ -3071,7 +3575,7 @@ class SIGMAFLIP:
             tile_icon = 'lock' if self.tile_link_locked else 'unlock'
             if not enabled:
                 tile_icon = f"{tile_icon}_disabled"
-            self.tile_link_btn.configure(state=state, image=self.icons.get(tile_icon))
+            self._set_icon(self.tile_link_btn, tile_icon, state)
         if hasattr(self, 'tile_cols_entry'):
             self.tile_cols_entry.configure(state=state)
         if hasattr(self, 'tile_rows_entry'):
@@ -3093,5 +3597,4 @@ class SIGMAFLIP:
             self.root.after_cancel(self._preview_refresh_id)
 
         self.save_user_settings()
-        self.purge_pycache_directories()
         self.root.destroy()
