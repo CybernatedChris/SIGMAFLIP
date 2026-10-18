@@ -2,9 +2,9 @@ import os
 import customtkinter as ctk
 import tkinter as tk
 from PIL import Image
-from sf.config import attach_grid_background, VERSION
+from sf.config import attach_grid_background, GridLabel, VERSION
 
-def show_about_dialog(parent, fonts, icon_path, main_color, sub_color, highlight_color, set_icon_fn):
+def show_about_dialog(parent, fonts, icon_path, main_color, sub_color, set_icon_fn):
     about = ctk.CTkToplevel(parent)
     about.title("About SIGMAFLIP")
     about.geometry("440x580")
@@ -22,17 +22,17 @@ def show_about_dialog(parent, fonts, icon_path, main_color, sub_color, highlight
     frame = ctk.CTkFrame(about, fg_color="transparent")
     frame.pack(fill=tk.BOTH, expand=True, padx=25, pady=20)
 
-    png_path = os.path.join(os.path.dirname(icon_path), "sigma.png")
+    png_path = os.path.join(os.path.dirname(icon_path), "sigmoid.png")
     if os.path.exists(png_path):
         try:
             pil_img = Image.open(png_path)
             logo_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(80, 80))
-            logo_label = ctk.CTkLabel(frame, image=logo_img, text="", fg_color="transparent")
+            logo_label = GridLabel(frame, image=logo_img, text="", fg_color="transparent")
             logo_label.pack(pady=(0, 5))
         except Exception as e:
             print(f"About image rendering error: {e}")
 
-    ctk.CTkLabel(
+    GridLabel(
         frame,
         text="SIGMAFLIP",
         font=fonts['title'],
@@ -42,12 +42,13 @@ def show_about_dialog(parent, fonts, icon_path, main_color, sub_color, highlight
 
     body_text = (
         "A FOSS Python-based alternative to SignaPic DSi, "
-        "used for converting videos into JPEG-based frames according to Flipnote speed.\n\n"
+        "used for converting videos and still images into signed JPEG frames "
+        "according to Flipnote speed.\n\n"
         "Slopped by CybernatedChris\n"
         "Powered by dsi_jpeg_signature_tool by NrNbaYoh"
     )
 
-    ctk.CTkLabel(
+    GridLabel(
         frame,
         text=body_text,
         font=fonts['small'],
@@ -57,7 +58,14 @@ def show_about_dialog(parent, fonts, icon_path, main_color, sub_color, highlight
         fg_color="transparent"
     ).pack(pady=5)
 
-    disclaimer_frame = ctk.CTkFrame(frame, fg_color="transparent", border_color="#f87171", border_width=1)
+    ALERT_RED, ALERT_AMBER = "#f87171", "#fbbf24"
+    dark = ctk.get_appearance_mode().lower() == "dark"
+    disclaimer_ink = "#f87171" if dark else "#b91c1c"
+    warning_ink = "#fbbf24" if dark else "#a16207"
+
+    disclaimer_frame = ctk.CTkFrame(frame, fg_color=("#fef2f2", "#1c1415"),
+                                    border_width=1, border_color=ALERT_RED, corner_radius=4)
+    disclaimer_frame._sf_flat = True
     disclaimer_frame.pack(fill="x", pady=10)
 
     disclaimer_text = (
@@ -68,30 +76,32 @@ def show_about_dialog(parent, fonts, icon_path, main_color, sub_color, highlight
         "With great power comes great responsibility. Please proceed entirely at your own risk."
     )
 
-    ctk.CTkLabel(
+    GridLabel(
         disclaimer_frame,
         text=disclaimer_text,
         font=fonts['tiny'],
-        text_color="#f87171",
+        text_color=disclaimer_ink,
         wraplength=360,
         justify="center",
         fg_color="transparent"
     ).pack(padx=10, pady=8)
 
-    secondary_frame = ctk.CTkFrame(frame, fg_color="transparent", border_color="#fbbf24", border_width=1)
+    secondary_frame = ctk.CTkFrame(frame, fg_color=("#fffbeb", "#1c1912"),
+                                   border_width=1, border_color=ALERT_AMBER, corner_radius=4)
+    secondary_frame._sf_flat = True
     secondary_frame.pack(fill="x", pady=(0, 10))
 
-    ctk.CTkLabel(
+    GridLabel(
         secondary_frame,
         text="This tool signs VIDEO FRAMES and PICTURES, NOT Flipnote PPM files!",
         font=fonts['tiny'],
-        text_color="#fbbf24",
+        text_color=warning_ink,
         wraplength=360,
         justify="center",
         fg_color="transparent"
     ).pack(padx=10, pady=8)
 
-    ctk.CTkLabel(
+    GridLabel(
         frame,
         text=VERSION,
         font=fonts['tiny'],
