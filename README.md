@@ -1,7 +1,7 @@
 <h1 align="center">
-  <img src="https://github.com/CybernatedChris/SIGMAFLIP/blob/main/sf/assets/img/sigma.png">
+  <img src="https://github.com/CybernatedChris/SIGMAFLIP/blob/main/sf/assets/img/sigmoid.png">
   SIGMAFLIP
-  <img src="https://github.com/CybernatedChris/SIGMAFLIP/blob/main/sf/assets/img/sigma.png">
+  <img src="https://github.com/CybernatedChris/SIGMAFLIP/blob/main/sf/assets/img/sigmoid.png">
 </h1>
 
 The ultimate tool for shitposting on Flipnote Studio. Or in other words, a FOSS Python alternative to the traditional SignaPic DSi, with video frame splitting and other rich features.
@@ -37,7 +37,7 @@ The DCIM structure for the 3DS is very much the same as the DSi, just different 
 | Video support? | ❌ | ✔ |
 | File Format | JPEG only | PNG, JPEG/JPG, WEBP, BMP (Still Images) MP4 AVI MOV MKV GIF (Video Frames)|
 | Last Activity | around 2019 to 2022 | 2026 and beyond (until I say so) |
-| Other known features | Resizing, widecut, and proportionate images, DPI optimization | More resizing options such as title layout, additional filters, black/white/custom backgrounds, display inversion, DCIM tree or SFPart_X tree exporting layouts, 3DS support, pit.bin deletion/detection confirmation, video export watermark|
+| Other known features | Resizing, widecut, and proportionate images, DPI optimization | More resizing options such as title layout, additional filters, black/white/custom backgrounds, display inversion, DCIM tree or SFPart_X tree exporting layouts, 3DS support, pit.bin deletion/detection confirmation, video export watermark, continuous frame/image exporting|
 
 *Works natively under Wine <br />
 **Desktop only
