@@ -1,7 +1,7 @@
 import os
 import customtkinter as ctk
 import tkinter as tk
-from sf.config import attach_grid_background
+from sf.config import draw_grid_on_canvas
 
 _INTERACTIVE = (ctk.CTkButton, ctk.CTkEntry, ctk.CTkSwitch, ctk.CTkSlider,
                 ctk.CTkOptionMenu, ctk.CTkSegmentedButton, ctk.CTkCheckBox)
@@ -22,38 +22,69 @@ def set_interactive_state(widget, enabled, skip=()):
 
 
 def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, settings, on_change_callback, set_icon_fn, get_export_structure=None, get_console_type=None, theme_bg=None, get_exporting=None, get_export_mode=None):
-    """Modeless Advanced Settings window."""
+    """Modeless Advanced Settings window: solid cards floating on the grid backdrop."""
     adv = ctk.CTkToplevel(parent)
+    adv.withdraw()
     adv.title("Advanced Settings")
     adv.geometry("400x650")
     adv.resizable(False, False)
     adv.transient(parent)
+
+    adv._sf_flat = True
 
     theme_bg = theme_bg or ("#f3f4f6", "#151515")
     adv.configure(fg_color=theme_bg)
 
     set_icon_fn(adv, delay=True)
 
-    attach_grid_background(adv)
-
     adv.update_idletasks()
-    x = parent.winfo_rootx() + (parent.winfo_width() - adv.winfo_width()) // 2
-    y = parent.winfo_rooty() + (parent.winfo_height() - adv.winfo_height()) // 2
+    x = parent.winfo_rootx() + (parent.winfo_width() - 400) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - 650) // 2
     adv.geometry(f"+{x}+{y}")
+    adv.deiconify()
 
-    frame = ctk.CTkScrollableFrame(adv, fg_color="transparent")
-    frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+    frame = ctk.CTkScrollableFrame(adv, fg_color=theme_bg, corner_radius=0)
+    frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+    content_grid = tk.Canvas(frame, highlightthickness=0, bd=0)
+    content_grid.place(x=0, y=0, relwidth=1, relheight=1)
+
+    def _redraw_grid(event=None):
+        try:
+            if not adv.winfo_exists():
+                return
+            w = content_grid.winfo_width()
+            h = content_grid.winfo_height()
+            if w > 1 and h > 1:
+                draw_grid_on_canvas(content_grid, w, h, ctk.get_appearance_mode().lower())
+        except Exception:
+            pass
+
+    adv._adv_grid_redraw = _redraw_grid
+    adv.after(150, _redraw_grid)
+
+    card_bg = ("#ffffff", "#1e1e1e")
+    card_border = ("#e5e7eb", "#2a2a2a")
+    PADX = 16
+
+    def make_card(master):
+        card = ctk.CTkFrame(master, fg_color=card_bg, corner_radius=8,
+                            border_width=1, border_color=card_border)
+        card._sf_flat = True
+        return card
+
+    card_rendering = make_card(frame)
+    card_rendering.pack(fill="x", padx=PADX, pady=(14, 14))
 
     ctk.CTkLabel(
-        frame,
+        card_rendering,
         text="Rendering Options",
         font=fonts['medium_bold'],
-        text_color=main_color,
-        fg_color="transparent"
-    ).pack(anchor="center", pady=(0, 10))
+        text_color=main_color
+    ).pack(pady=(12, 8))
 
-    jpg_quality_frame = ctk.CTkFrame(frame, fg_color="transparent")
-    jpg_quality_frame.pack(fill="x", pady=5)
+    jpg_quality_frame = ctk.CTkFrame(card_rendering, fg_color="transparent")
+    jpg_quality_frame.pack(fill="x", padx=PADX, pady=(0, 4))
 
     ctk.CTkLabel(
         jpg_quality_frame,
@@ -62,12 +93,26 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         text_color=main_color
     ).pack(side="left")
 
-    jpg_quality_var = tk.StringVar(value=str(settings.get("jpg_quality", 95)))
+    def _clamp_jpg(v):
+        try:
+            return max(1, min(100, int(v)))
+        except (TypeError, ValueError):
+            return 95
+
+    jpg_quality_var = tk.StringVar(value=str(_clamp_jpg(settings.get("jpg_quality", 95))))
+
+    def _jpg_input_ok(proposed):
+        return proposed == "" or (proposed.isdigit() and len(proposed) <= 3)
+
     def on_jpg_quality_change(event=None):
         val = jpg_quality_var.get().strip()
-        if val.isdigit() and 1 <= int(val) <= 100:
-            settings["jpg_quality"] = int(val)
+        if val.isdigit():
+            q = _clamp_jpg(val)
+            jpg_quality_var.set(str(q))
+            settings["jpg_quality"] = q
             on_change_callback()
+        else:
+            jpg_quality_var.set(str(_clamp_jpg(settings.get("jpg_quality", 95))))
         if event and event.keysym == "Return":
             frame.focus_set()
 
@@ -76,9 +121,11 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         textvariable=jpg_quality_var,
         width=50,
         font=fonts['small'],
-        fg_color=sub_color,
+        fg_color=("#e2e8f0", "#2b2b2b"),
         text_color=main_color,
-        border_color=highlight_color
+        border_color=highlight_color,
+        validate="key",
+        validatecommand=(adv.register(_jpg_input_ok), "%P")
     )
     jpg_quality_entry.pack(side="right")
     jpg_quality_entry.bind("<Return>", on_jpg_quality_change)
@@ -89,11 +136,15 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         val = bw_var.get()
         settings["black_and_white"] = val
         if val:
-            dither_menu.configure(state="normal")
+            menu = getattr(dither_frame, "_dither_menu", None)
+            if menu is not None:
+                menu.configure(state="normal")
             perf_switch.configure(state="normal")
             invert_switch.configure(state="normal")
         else:
-            dither_menu.configure(state="disabled")
+            menu = getattr(dither_frame, "_dither_menu", None)
+            if menu is not None:
+                menu.configure(state="disabled")
             perf_switch.configure(state="disabled")
             invert_switch.configure(state="disabled")
             if perf_var.get():
@@ -105,7 +156,7 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         on_change_callback()
 
     bw_switch = ctk.CTkSwitch(
-        frame,
+        card_rendering,
         text="Pure Black & White (Binary Mode)",
         font=fonts['small'],
         text_color=main_color,
@@ -113,7 +164,7 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         command=toggle_bw,
         progress_color=highlight_color
     )
-    bw_switch.pack(anchor="w", pady=8)
+    bw_switch.pack(anchor="w", padx=PADX, pady=6)
 
     invert_var = tk.BooleanVar(value=settings.get("invert_bw", False))
     def toggle_invert():
@@ -121,7 +172,7 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         on_change_callback()
 
     invert_switch = ctk.CTkSwitch(
-        frame,
+        card_rendering,
         text="Invert Display Colors",
         font=fonts['small'],
         text_color=main_color,
@@ -131,7 +182,7 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
     )
     if not bw_var.get():
         invert_switch.configure(state="disabled")
-    invert_switch.pack(anchor="w", pady=8)
+    invert_switch.pack(anchor="w", padx=PADX, pady=6)
 
     perf_var = tk.BooleanVar(value=settings.get("performance_mode", False))
     def toggle_perf():
@@ -139,7 +190,7 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         on_change_callback()
 
     perf_switch = ctk.CTkSwitch(
-        frame,
+        card_rendering,
         text="Performance Mode",
         font=fonts['small'],
         text_color=main_color,
@@ -149,10 +200,10 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
     )
     if not bw_var.get():
         perf_switch.configure(state="disabled")
-    perf_switch.pack(anchor="w", pady=8)
+    perf_switch.pack(anchor="w", padx=PADX, pady=6)
 
-    dither_frame = ctk.CTkFrame(frame, fg_color="transparent")
-    dither_frame.pack(fill="x", pady=8)
+    dither_frame = ctk.CTkFrame(card_rendering, fg_color="transparent")
+    dither_frame.pack(fill="x", padx=PADX, pady=(8, 4))
 
     ctk.CTkLabel(
         dither_frame,
@@ -184,46 +235,36 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
 
     dither_current = tk.StringVar(value=settings.get("dither_mode", "None"))
 
-    def show_dither_menu(event):
-        curr_mode = ctk.get_appearance_mode().lower()
-        is_dark = curr_mode == "dark"
-        menu_opts = dict(
-            bg="#1a1a1a" if is_dark else "#ffffff",
-            fg="#E2E8F0" if is_dark else "#111827",
-            activebackground="#475569",
-            activeforeground="#111827",
-            borderwidth=0,
-            font=(fonts['small'].cget("family"), 10)
-        )
-        m = tk.Menu(adv, tearoff=0, **menu_opts)
-        for mode in dither_modes:
-            prefix = "\u2713 " if mode == dither_current.get() else "   "
-            m.add_command(label=prefix + mode, command=lambda v=mode: pick_dither(v))
-        m.tk_popup(event.x_root, event.y_root)
-
     def pick_dither(val):
         dither_current.set(val)
         settings["dither_mode"] = val
         on_change_callback()
 
-    dither_menu = ctk.CTkButton(
-        dither_frame,
-        textvariable=dither_current,
-        anchor="w",
-        fg_color=theme_bg or ("#ffffff", "#2b2b2b"),
-        hover_color=highlight_color,
-        text_color=("#1e293b", "#E2E8F0"),
-        font=fonts['tiny'],
-        height=28
-    )
-    dither_menu.bind("<Button-1>", show_dither_menu)
-    dither_menu.pack(side=tk.LEFT, fill="x", expand=True)
+    def _build_dither_late():
+        dither_menu = ctk.CTkOptionMenu(
+            dither_frame,
+            values=dither_modes,
+            variable=dither_current,
+            command=pick_dither,
+            fg_color=("#e2e8f0", "#2b2b2b"),
+            button_color=("#cbd5e1", "#334155"),
+            button_hover_color=highlight_color,
+            dropdown_fg_color=("#ffffff", "#2b2b2b"),
+            dropdown_hover_color=highlight_color,
+            dropdown_text_color=("#1e293b", "#E2E8F0"),
+            text_color=("#1e293b", "#E2E8F0"),
+            font=fonts['tiny'], dropdown_font=fonts['tiny']
+        )
+        dither_menu.set(dither_current.get())
+        dither_menu.pack(side=tk.LEFT, fill="x", expand=True)
+        dither_frame._dither_menu = dither_menu
+        if not bw_var.get():
+            dither_menu.configure(state="disabled")
 
-    if not bw_var.get():
-        dither_menu.configure(state="disabled")
+    adv.after(10, _build_dither_late)
 
-    contrast_frame = ctk.CTkFrame(frame, fg_color="transparent")
-    contrast_frame.pack(fill="x", pady=15)
+    contrast_frame = ctk.CTkFrame(card_rendering, fg_color="transparent")
+    contrast_frame.pack(fill="x", padx=PADX, pady=(12, 14))
 
     contrast_label_var = tk.StringVar(value=f"Contrast: {settings.get('contrast', 1.0):.2f}x")
     ctk.CTkLabel(
@@ -253,16 +294,15 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
     contrast_slider.set(settings.get("contrast", 1.0))
     contrast_slider.pack(fill="x", pady=(5, 0))
 
-    wm_section = ctk.CTkFrame(frame, fg_color="transparent")
-    wm_section.pack(fill="x")
+    card_watermark = make_card(frame)
+    card_watermark.pack(fill="x", padx=PADX, pady=(14, 14))
 
     ctk.CTkLabel(
-        wm_section,
+        card_watermark,
         text="Watermark",
         font=fonts['medium_bold'],
-        text_color=main_color,
-        fg_color="transparent"
-    ).pack(anchor="center", pady=(15, 6))
+        text_color=main_color
+    ).pack(pady=(12, 8))
 
     wm_enable_var = tk.BooleanVar(value=settings.get("watermark_enabled", False))
     def toggle_wm():
@@ -270,27 +310,27 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         on_change_callback()
 
     ctk.CTkSwitch(
-        wm_section,
+        card_watermark,
         text="Enable Watermark Overlay",
         font=fonts['small'],
         text_color=main_color,
         variable=wm_enable_var,
         command=toggle_wm,
         progress_color=highlight_color
-    ).pack(anchor="w", pady=6)
+    ).pack(anchor="w", padx=PADX, pady=4)
 
     wm_path_var = tk.StringVar(value=os.path.basename(settings.get("watermark_path", "")) or "Default watermark")
     ctk.CTkLabel(
-        wm_section,
+        card_watermark,
         textvariable=wm_path_var,
         font=fonts['tiny'],
         text_color=sub_color,
         fg_color="transparent",
-        wraplength=330
-    ).pack(anchor="w")
+        wraplength=300
+    ).pack(anchor="w", padx=PADX, pady=(2, 4))
 
-    wm_btn_row = ctk.CTkFrame(wm_section, fg_color="transparent")
-    wm_btn_row.pack(fill="x", pady=(4, 6))
+    wm_btn_row = ctk.CTkFrame(card_watermark, fg_color="transparent")
+    wm_btn_row.pack(fill="x", padx=PADX, pady=(6, 2))
 
     def browse_watermark():
         from tkinter import filedialog
@@ -338,7 +378,7 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         on_change_callback()
 
     pos_seg = ctk.CTkSegmentedButton(
-        wm_section,
+        card_watermark,
         values=list(pos_map.keys()),
         command=on_pos_select,
         font=fonts['tiny'],
@@ -346,16 +386,16 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         selected_hover_color=highlight_color
     )
     pos_seg.set(rev_pos_map.get(settings.get("watermark_position", "bottomright"), "Bottom Right"))
-    pos_seg.pack(fill="x", pady=6)
+    pos_seg.pack(fill="x", padx=PADX, pady=10)
 
     scale_label_var = tk.StringVar(value=f"Scale: {settings.get('watermark_scale', 40)}% width")
     ctk.CTkLabel(
-        wm_section,
+        card_watermark,
         textvariable=scale_label_var,
         font=fonts['tiny'],
         text_color=sub_color,
         fg_color="transparent"
-    ).pack(anchor="w")
+    ).pack(anchor="w", padx=PADX)
 
     def on_scale_change(val):
         v = int(float(val))
@@ -364,7 +404,7 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         on_change_callback()
 
     scale_slider = ctk.CTkSlider(
-        wm_section,
+        card_watermark,
         from_=5,
         to=60,
         number_of_steps=55,
@@ -374,18 +414,20 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         command=on_scale_change
     )
     scale_slider.set(settings.get("watermark_scale", 40))
-    scale_slider.pack(fill="x", pady=(2, 6))
+    scale_slider.pack(fill="x", padx=PADX, pady=(4, 14))
+
+    card_export = make_card(frame)
+    card_export.pack(fill="x", padx=PADX, pady=(14, 14))
 
     ctk.CTkLabel(
-        frame,
+        card_export,
         text="Export Options",
         font=fonts['medium_bold'],
-        text_color=main_color,
-        fg_color="transparent"
-    ).pack(anchor="center", pady=(0, 10))
+        text_color=main_color
+    ).pack(pady=(12, 8))
 
-    capacity_frame = ctk.CTkFrame(frame, fg_color="transparent")
-    capacity_frame.pack(fill="x", pady=15)
+    capacity_frame = ctk.CTkFrame(card_export, fg_color="transparent")
+    capacity_frame.pack(fill="x", padx=PADX, pady=(4, 6))
 
     capacity_label = ctk.CTkLabel(
         capacity_frame,
@@ -421,39 +463,43 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
     capacity_entry.bind("<Return>", on_capacity_change)
 
     if get_export_structure is not None:
+        last_struct_state = {"disabled": None}
         def poll_structure():
             if adv.winfo_exists():
                 exporting = bool(get_exporting and get_exporting())
-                if exporting or get_export_structure() == "parts":
-                    capacity_entry.configure(state="disabled")
-                    capacity_label.configure(text_color=("#9ca3af", "#6b7280"))
-                else:
-                    capacity_entry.configure(state="normal")
-                    capacity_label.configure(text_color=sub_color)
+                disabled = exporting or get_export_structure() == "parts"
+                if last_struct_state["disabled"] != disabled:
+                    last_struct_state["disabled"] = disabled
+                    if disabled:
+                        capacity_entry.configure(state="disabled")
+                        capacity_label.configure(text_color=("#9ca3af", "#6b7280"))
+                    else:
+                        capacity_entry.configure(state="normal")
+                        capacity_label.configure(text_color=sub_color)
                 adv.after(500, poll_structure)
         adv.after(500, poll_structure)
 
     pit_title_label = ctk.CTkLabel(
-        frame,
+        card_export,
         text="Pit File",
         font=fonts['medium_bold'],
         text_color=main_color,
         fg_color="transparent"
     )
-    pit_title_label.pack(anchor="center", pady=(0, 10))
+    pit_title_label.pack(pady=(12, 6))
 
     pit_dir_var = tk.StringVar(value=settings.get("pit_dir", ""))
     pit_status_var = tk.StringVar(value="")
 
     pit_dir_label = ctk.CTkLabel(
-        frame,
+        card_export,
         textvariable=pit_dir_var,
         font=fonts['tiny'],
         text_color=sub_color,
         fg_color="transparent",
-        wraplength=330
+        wraplength=300
     )
-    pit_dir_label.pack(anchor="center", pady=(0, 5))
+    pit_dir_label.pack(pady=(0, 6))
 
     def browse_pit_dir():
         from tkinter import filedialog
@@ -464,7 +510,7 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
             pit_status_var.set("")
 
     browse_btn = ctk.CTkButton(
-        frame,
+        card_export,
         text="Browse Root...",
         font=fonts['small'],
         fg_color=("#2563eb", "#3b82f6"),
@@ -472,7 +518,7 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         text_color="#ffffff",
         command=browse_pit_dir
     )
-    browse_btn.pack(anchor="center", pady=(0, 5))
+    browse_btn.pack(pady=(0, 4))
 
     def delete_pit():
         from tkinter import messagebox
@@ -493,7 +539,7 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
             pit_status_var.set(f"Could not delete: {e}")
 
     delete_btn = ctk.CTkButton(
-        frame,
+        card_export,
         text="Delete Pit File",
         font=fonts['small'],
         fg_color=("#dc2626", "#b91c1c"),
@@ -501,39 +547,46 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
         text_color="#ffffff",
         command=delete_pit
     )
-    delete_btn.pack(anchor="center", pady=(0, 5))
+    delete_btn.pack(pady=(0, 4))
 
     ctk.CTkLabel(
-        frame,
+        card_export,
         textvariable=pit_status_var,
         font=fonts['tiny'],
         text_color=sub_color,
         fg_color="transparent",
-        wraplength=330
-    ).pack(anchor="center")
+        wraplength=300
+    ).pack(pady=(2, 14))
 
     if get_console_type is not None:
+        last_console_state = {"state": None, "is_3ds": None}
         def poll_console():
             if adv.winfo_exists():
                 exporting = bool(get_exporting and get_exporting())
                 is_3ds = get_console_type() == "3ds"
-                pit_title_label.configure(text_color=("#dc2626", "#ef4444") if is_3ds else main_color)
                 pit_state = "disabled" if (exporting or is_3ds) else "normal"
-                browse_btn.configure(state=pit_state)
-                delete_btn.configure(state=pit_state)
+
+                if (last_console_state["state"] != pit_state or
+                        last_console_state["is_3ds"] != is_3ds):
+                    last_console_state["state"] = pit_state
+                    last_console_state["is_3ds"] = is_3ds
+                    pit_title_label.configure(text_color=("#dc2626", "#ef4444") if is_3ds else main_color)
+                    browse_btn.configure(state=pit_state)
+                    delete_btn.configure(state=pit_state)
                 adv.after(500, poll_console)
         adv.after(500, poll_console)
 
     if get_exporting is not None:
-        gated = (dither_menu, perf_switch, invert_switch)
         def apply_state(exporting, still_mode):
+            menu = getattr(dither_frame, "_dither_menu", None)
+            gated = (menu, perf_switch, invert_switch) if menu is not None else (perf_switch, invert_switch)
             gated_state = "disabled" if exporting else ("normal" if bw_var.get() else "disabled")
             for widget in gated:
                 widget.configure(state=gated_state)
             set_interactive_state(
                 frame, not exporting,
-                skip=gated + (capacity_entry, browse_btn, delete_btn, wm_section))
-            set_interactive_state(wm_section, not (exporting or still_mode))
+                skip=gated + (capacity_entry, browse_btn, delete_btn, card_watermark))
+            set_interactive_state(card_watermark, not (exporting or still_mode))
         last = {"exporting": None, "still": None}
         def poll_state():
             if not adv.winfo_exists():
@@ -546,5 +599,12 @@ def show_advanced_dialog(parent, fonts, main_color, sub_color, highlight_color, 
                 apply_state(exporting, still_mode)
             adv.after(300, poll_state)
         poll_state()
+
+    adv.geometry("+30000+30000")
+    adv.deiconify()
+    for _ in range(6):
+        adv.update()
+    adv.geometry(f"+{x}+{y}")
+    adv.update_idletasks()
 
     return adv
