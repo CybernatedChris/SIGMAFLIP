@@ -12,15 +12,24 @@ except ImportError:
             return lambda fn: fn
         return f
 
-# Precompute Blue Noise 64x64 matrix once at module load
 import random
 _rnd = random.Random(42)
 _flat_blue_noise = list(range(4096))
 _rnd.shuffle(_flat_blue_noise)
 BLUE_NOISE_MATRIX = [_flat_blue_noise[i*64:(i+1)*64] for i in range(64)]
 
-# Global cache for threshold matrices
 _THRESH_CACHE = {}
+
+_SETUP_CACHE = {}
+
+
+def _cached_setup(kind, width, height, builder):
+    key = (kind, width, height)
+    val = _SETUP_CACHE.get(key)
+    if val is None:
+        val = builder()
+        _SETUP_CACHE[key] = val
+    return val
 
 def get_threshold_matrix(mode):
     if mode in _THRESH_CACHE:
@@ -41,7 +50,7 @@ def get_threshold_matrix(mode):
     elif mode == "Blue Noise 64x64":
         matrix = BLUE_NOISE_MATRIX
         div, size = 4096, 64
-    else:  # Bayer 8x8 default
+    else:
         matrix = [
             [ 0, 48, 12, 60,  3, 51, 15, 63],
             [32, 16, 44, 28, 35, 19, 47, 31],
@@ -344,10 +353,7 @@ def apply_error_diffusion(gray_img, kernel_name):
     return Image.fromarray(np.where(buf < 128, 0, 255).astype(np.uint8), mode='L')
 
 
-def apply_dot_diffusion(gray_img):
-    """Dot diffusion: processes pixels in a class-matrix order instead of scanline order."""
-    width, height = gray_img.size
-
+def _build_dot_order(width, height):
     class_matrix = [
         [35, 49, 41, 53, 37, 51, 43, 55],
         [63, 15, 59, 11, 61, 13, 57,  9],
@@ -371,16 +377,10 @@ def apply_dot_diffusion(gray_img):
 
     order_y = np.array([t[1] for t in order], dtype=np.int64)
     order_x = np.array([t[2] for t in order], dtype=np.int64)
-
-    buf = np.array(gray_img, dtype=np.float32)
-    _dot_diffusion_inner(buf, order_y, order_x, height, width)
-    return Image.fromarray(np.where(buf < 128, 0, 255).astype(np.uint8), mode='L')
+    return order_y, order_x
 
 
-def apply_riemersma(gray_img):
-    """Riemersma dithering: error diffusion along a serpentine path."""
-    width, height = gray_img.size
-
+def _build_riemersma_path(width, height):
     path_x = np.empty(width * height, dtype=np.int64)
     path_y = np.empty(width * height, dtype=np.int64)
     idx = 0
@@ -395,10 +395,43 @@ def apply_riemersma(gray_img):
                 path_x[idx] = x
                 path_y[idx] = y
                 idx += 1
+    return path_x, path_y
+
+
+def apply_dot_diffusion(gray_img):
+    """Dot diffusion: processes pixels in a class-matrix order instead of scanline order."""
+    width, height = gray_img.size
+
+    order_y, order_x = _cached_setup("dot", width, height, lambda: _build_dot_order(width, height))
+
+    buf = np.array(gray_img, dtype=np.float32)
+    _dot_diffusion_inner(buf, order_y, order_x, height, width)
+    return Image.fromarray(np.where(buf < 128, 0, 255).astype(np.uint8), mode='L')
+
+
+def apply_riemersma(gray_img):
+    """Riemersma dithering: error diffusion along a serpentine path."""
+    width, height = gray_img.size
+
+    path_x, path_y = _cached_setup("riemersma", width, height, lambda: _build_riemersma_path(width, height))
 
     buf = np.array(gray_img, dtype=np.float32)
     _riemersma_inner(buf, path_x, path_y, height, width)
     return Image.fromarray(np.where(buf < 128, 0, 255).astype(np.uint8), mode='L')
+
+
+def warmup():
+    """Runs each numba kernel once on a tiny image so the JIT compile happens in the
+    background at startup instead of stalling the first export. Signature is what
+    matters to numba, not image size, so an 8x8 probe compiles the real kernels."""
+    if not HAS_NUMBA:
+        return
+    probe = Image.new("L", (8, 8), 128)
+    for name in ("Jarvis-Judice-Ninke", "Stevenson-Arce", "Atkinson",
+                 "Sierra 3-Row", "Sierra Lite"):
+        apply_error_diffusion(probe, name)
+    apply_dot_diffusion(probe)
+    apply_riemersma(probe)
 
 
 def apply_woodcut(gray_img):
