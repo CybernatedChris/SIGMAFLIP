@@ -79,6 +79,8 @@ python main.py
 <img width="502" height="632" alt="imageselector" src="https://github.com/user-attachments/assets/083ce05a-21e2-462d-8f20-fbd0fa9c3be9" />
 <img width="502" height="632" alt="imgselectorbulkpreview" src="https://github.com/user-attachments/assets/6b4f1c35-c63e-4b69-9e38-5d33df13be1d" />
 
+###### Screenshots as of v1
+
 ## Video Demos
 ### Running on Windows 10 LTSC 21h2
 https://github.com/user-attachments/assets/b0c372c4-e0da-4705-a62d-e6118309216f
